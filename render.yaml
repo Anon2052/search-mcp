@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: search-mcp
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    plan: starter
+    autoDeploy: true
+    envVars:
+      - key: X402_ENABLED
+        value: "false"
+      - key: RATE_LIMIT
+        value: "60/minute"
+      - key: SEARCH_API_KEY
+        sync: false
