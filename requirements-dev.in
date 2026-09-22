@@ -1,0 +1,5 @@
+# Dev dependencies — exact pins. Regenerate requirements-dev.txt with:
+#   .venv/bin/pip-compile --generate-hashes requirements-dev.in -o requirements-dev.txt
+pytest==9.1.1
+ruff==0.16.8
+pip-audit==2.10.1
