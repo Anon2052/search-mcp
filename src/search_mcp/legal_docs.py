@@ -2,15 +2,14 @@
 """Public legal documents served at /legal/* (Stripe onboarding).
 
 The documents are held verbatim as string constants so they ship inside the
-package with no package-data/Docker pitfalls. Placeholders ([LLC NAME],
-[DATE], [CONTACT EMAIL]) are intentionally left unfilled here — this is the
-template, not legal advice.
+package with no package-data/Docker pitfalls. Filled-in with the LLC name,
+effective date, and contact email.
 """
 
 TERMS_OF_SERVICE = """# Terms of Service
 
-**[LLC NAME]** ("we," "us," "our")
-Effective date: [DATE] · Last updated: [DATE]
+**IOConnex LLC** ("we," "us," "our")
+Effective date: September 23, 2026 · Last updated: September 23, 2026
 
 > *Template document, not legal advice. Have an attorney review before relying on it.*
 
@@ -45,11 +44,11 @@ THE SERVICES ARE PROVIDED "AS IS" AND "AS AVAILABLE," WITHOUT WARRANTIES OF ANY 
 
 ## 6. Limitation of liability
 
-TO THE MAXIMUM EXTENT PERMITTED BY LAW, [LLC NAME] SHALL NOT BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR PUNITIVE DAMAGES ARISING FROM YOUR USE OF THE SERVICES. OUR TOTAL LIABILITY FOR ANY CLAIM SHALL NOT EXCEED THE AMOUNTS YOU PAID US IN THE THREE (3) MONTHS PRECEDING THE CLAIM.
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, IOConnex LLC SHALL NOT BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR PUNITIVE DAMAGES ARISING FROM YOUR USE OF THE SERVICES. OUR TOTAL LIABILITY FOR ANY CLAIM SHALL NOT EXCEED THE AMOUNTS YOU PAID US IN THE THREE (3) MONTHS PRECEDING THE CLAIM.
 
 ## 7. Indemnification
 
-You agree to indemnify and hold harmless [LLC NAME] from claims arising from your misuse of the Services or violation of these Terms.
+You agree to indemnify and hold harmless IOConnex LLC from claims arising from your misuse of the Services or violation of these Terms.
 
 ## 8. Termination
 
@@ -65,13 +64,13 @@ These Terms are governed by the laws of the State of Arizona, without regard to 
 
 ## 11. Contact
 
-[CONTACT EMAIL]
+scogg3@gmail.com
 """
 
 PRIVACY_POLICY = """# Privacy Policy
 
-**[LLC NAME]** ("we," "us," "our")
-Effective date: [DATE] · Last updated: [DATE]
+**IOConnex LLC** ("we," "us," "our")
+Effective date: September 23, 2026 · Last updated: September 23, 2026
 
 > *Template document, not legal advice. Have an attorney review before relying on it.*
 
@@ -118,13 +117,13 @@ We may update this policy; material changes will be posted with a revised effect
 
 ## 8. Contact
 
-[CONTACT EMAIL]
+scogg3@gmail.com
 """
 
 REFUND_POLICY = """# Refund Policy
 
-**[LLC NAME]** ("we," "us," "our")
-Effective date: [DATE] · Last updated: [DATE]
+**IOConnex LLC** ("we," "us," "our")
+Effective date: September 23, 2026 · Last updated: September 23, 2026
 
 > *Template document, not legal advice. Have an attorney review before relying on it.*
 
@@ -138,7 +137,7 @@ Monthly subscription plans come with a 30-day money-back guarantee from your ini
 
 ## 3. How to request a refund
 
-Email [CONTACT EMAIL] with your Stripe receipt or subscription ID and the reason for the request. We respond within 5 business days.
+Email scogg3@gmail.com with your Stripe receipt or subscription ID and the reason for the request. We respond within 5 business days.
 
 ## 4. Chargebacks
 

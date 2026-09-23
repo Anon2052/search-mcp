@@ -2,7 +2,7 @@
 
 These URLs are the ones submitted to Stripe onboarding: they must be
 public (200 with no auth), never x402-metered, never rate-limited, and the
-content must match the canonical documents verbatim (placeholders unfilled).
+content must match the canonical (filled-in) documents verbatim.
 """
 
 from __future__ import annotations
@@ -25,10 +25,13 @@ def test_legal_routes_serve_verbatim_markdown():
         r = xc.get(path)
         assert r.status_code == 200, f"{path}: got {r.status_code}"
         assert "text/markdown" in r.headers["content-type"]
-        # Verbatim: exact match to the canonical document, placeholders unfilled.
+        # Verbatim: exact match to the canonical filled-in document.
         assert r.text == doc
         assert heading in r.text
-        assert "[LLC NAME]" in r.text
+        assert "IOConnex LLC" in r.text
+        # No placeholders may remain in the filled-in docs.
+        for placeholder in ("[LLC NAME]", "[DATE]", "[CONTACT EMAIL]"):
+            assert placeholder not in r.text
 
 
 def test_legal_routes_never_402_when_x402_enabled(monkeypatch):
