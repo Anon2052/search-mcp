@@ -194,13 +194,14 @@ def test_tools_call_requires_payment(stubbed_backends, monkeypatch):
             "method": "tools/call",
             "params": {"name": "fetch_url", "arguments": {"url": "https://example.com/"}},
         }
-        # NOTE: POST /mcp/ (trailing slash). Bare /mcp 307-redirects on this
-        # branch (separate redirect-fix track); the TestClient follows the
-        # redirect and would replay the X-Payment header -> duplicate_payment.
-        r = xc.post("/mcp/", json=body)
+        # Bare /mcp (no trailing slash) — regression test for the 307 redirect
+        # fix: the TestClient follows redirects, and a 307 would replay the
+        # X-Payment header to /mcp/, tripping the anti-replay guard
+        # (duplicate_payment -> 402) instead of the expected 200.
+        r = xc.post("/mcp", json=body)
         assert r.status_code == 402
         assert r.json()["paymentRequirements"]["maxAmountRequired"] == "10000"
-        r = xc.post("/mcp/", json=body, headers=_x402_header(value_atomic=10000))
+        r = xc.post("/mcp", json=body, headers=_x402_header(value_atomic=10000))
         assert r.status_code == 200, r.text
 
 
