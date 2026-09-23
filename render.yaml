@@ -33,9 +33,18 @@ services:
         sync: false
       - key: STRIPE_CANCEL_URL
         sync: false
-      - key: BILLING_DB_PATH
-        value: "./data/subscribers.db"
+      # BILLING_DB_PATH is intentionally NOT set here: the code default points
+      # at the persistent disk mount below (single source of truth). Override
+      # per-environment in the dashboard if ever needed.
       - key: RATE_LIMIT
         value: "60/minute"
       - key: SEARCH_API_KEY
         sync: false
+    # Persistent disk (1 GB = $0.25/mo) so the SQLite subscriber store
+    # survives redeploys. Without it, Render's ephemeral filesystem wipes
+    # paid subscriber keys on every deploy. Added via the service's Disk
+    # page in the dashboard — see PR body for the exact clicks.
+    disk:
+      name: search-mcp-data
+      mountPath: /var/lib/search-mcp
+      sizeGB: 1

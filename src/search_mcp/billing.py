@@ -8,7 +8,9 @@ Env:
     STRIPE_ENABLED (default "false")
     STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_ID (required)
     STRIPE_SUCCESS_URL, STRIPE_CANCEL_URL (required for checkout)
-    BILLING_DB_PATH (default "./data/subscribers.db"; parent dir is created)
+    BILLING_DB_PATH (default "/var/lib/search-mcp/billing.db" — the Render
+        persistent-disk mount; parent dir is created). Override locally with
+        e.g. "./data/subscribers.db" when developing outside Render.
 
 Subscriber storage: stdlib sqlite3. Only the SHA-256 hash of a subscriber
 key is stored — never the raw token. All endpoints 404 unless Stripe is
@@ -32,6 +34,8 @@ log = logging.getLogger("search_mcp.billing")
 
 router = APIRouter(prefix="/billing")
 
+# Idempotent: CREATE TABLE IF NOT EXISTS runs on every _db() open, so the
+# first boot on a fresh Render disk works without a migration step.
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS subscribers (
     key_hash   TEXT PRIMARY KEY,
@@ -40,8 +44,13 @@ CREATE TABLE IF NOT EXISTS subscribers (
     status     TEXT,
     created_at TEXT,
     updated_at TEXT
-)
+);
 """
+
+# Default lives on the Render persistent-disk mount (see render.yaml `disk:`).
+# A redeploy would wipe ./data on Render's ephemeral filesystem.
+_DISK_DB_PATH = "/var/lib/search-mcp/billing.db"
+
 
 _PLACEHOLDER_HASH = "pending:" + "0" * 56  # replaced by GET /billing/key
 
@@ -65,7 +74,7 @@ def stripe_effective_enabled() -> bool:
 
 
 def _db_path() -> str:
-    return os.environ.get("BILLING_DB_PATH", "./data/subscribers.db")
+    return os.environ.get("BILLING_DB_PATH", _DISK_DB_PATH)
 
 
 def _db() -> sqlite3.Connection:

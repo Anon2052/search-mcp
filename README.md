@@ -52,7 +52,7 @@ curl localhost:8000/health
 | `X402_PRICE_SEARCH_WEB_USDC` / `X402_PRICE_FETCH_URL_USDC` | `0.025` / `0.01` | Proposed defaults — Scott's call |
 | `STRIPE_ENABLED` | `false` | Monthly subscriber plans. Requires `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_ID` (create the product/price in the Stripe dashboard) |
 | `STRIPE_SUCCESS_URL` / `STRIPE_CANCEL_URL` | unset | Checkout redirect URLs (success URL should include `?session_id={CHECKOUT_SESSION_ID}`) |
-| `BILLING_DB_PATH` | `./data/subscribers.db` | SQLite subscriber store (only key hashes are stored) |
+| `BILLING_DB_PATH` | `/var/lib/search-mcp/billing.db` | SQLite subscriber store (only key hashes are stored). Must sit on the Render persistent disk (`render.yaml` `disk:` stanza); when developing locally, set this to `./data/subscribers.db` since `/var/lib` usually isn't writable |
 | `RATE_LIMIT` | `60/minute` | e.g. `600/hour` |
 
 ## Billing endpoints

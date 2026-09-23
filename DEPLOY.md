@@ -39,7 +39,16 @@ No secrets are hardcoded in the image. `SEARCH_API_KEY` is supplied at deploy ti
 3. Blueprint name: `search-mcp`. Review shows one web service (Starter).
 4. **Deploy Blueprint** — when prompted, paste your Tavily `SEARCH_API_KEY`.
 5. **Create Web Service** — deploys on every push to `main`.
-6. Custom domain: **Settings → Custom Domains** (free, TLS automatic).
+6. **Attach the persistent disk (required for Stripe subscribers).** Render's
+   dashboard creates disks from the service's Disk page; don't assume the
+   `disk:` stanza in `render.yaml` attaches it to an already-linked service.
+   Steps: open the `search-mcp` service in the dashboard → **Disks** (left
+   sidebar) → set mount path `/var/lib/search-mcp`, size **1 GB** ($0.25/mo)
+   → **Add disk**. Render triggers a redeploy and the disk is live when the
+   deploy finishes. Without the disk, every redeploy wipes the subscriber
+   database (paid keys are lost). Deploys get a few seconds of downtime
+   once a disk is attached (no zero-downtime deploys with disks).
+7. Custom domain: **Settings → Custom Domains** (free, TLS automatic).
 
 ### Railway
 1. railway.app → **New Project → Deploy from GitHub** → select the repo.

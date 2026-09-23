@@ -495,3 +495,8 @@ def test_billing_status_no_secrets(stubbed_backends, monkeypatch, tmp_path):
     body = r.json()
     assert body == {"stripe_enabled": True, "x402_enabled": False}
     assert "sk_test" not in json.dumps(body)
+
+
+def test_db_default_path_is_disk_mount(monkeypatch):
+    monkeypatch.delenv("BILLING_DB_PATH", raising=False)
+    assert billing_mod._db_path() == "/var/lib/search-mcp/billing.db"
