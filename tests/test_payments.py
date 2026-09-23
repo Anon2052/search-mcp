@@ -510,7 +510,7 @@ def _usage_row(tmp_path):
 
     conn = sqlite3.connect(str(tmp_path / "subs.db"))
     try:
-        return conn.execute("SELECT month, calls FROM subscriber_usage").fetchone()
+        return conn.execute("SELECT month, credits FROM subscriber_usage").fetchone()
     finally:
         conn.close()
 
@@ -520,10 +520,34 @@ def test_db_default_path_is_disk_mount(monkeypatch):
     assert billing_mod._db_path() == "/var/lib/search-mcp/billing.db"
 
 
+def test_credit_cost_derives_from_price_map(monkeypatch):
+    """Credit cost must come from the same price map the x402 middleware
+    charges with — no duplicated price table."""
+    assert billing_mod.credits_for_price_usdc(x402_mod.price_for_tool_usdc("search_web")) == 2.5
+    assert billing_mod.credits_for_price_usdc(x402_mod.price_for_tool_usdc("fetch_url")) == 1.0
+    # An env price override flows through to credits automatically.
+    monkeypatch.setenv("X402_PRICE_SEARCH_WEB_USDC", "0.05")
+    assert billing_mod.credits_for_price_usdc(x402_mod.price_for_tool_usdc("search_web")) == 5.0
+
+
+def test_old_call_limit_env_is_gone(monkeypatch):
+    """SUBSCRIBER_MONTHLY_CALL_LIMIT no longer has any effect."""
+    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CALL_LIMIT", "999999")
+    monkeypatch.delenv("SUBSCRIBER_MONTHLY_CREDIT_LIMIT", raising=False)
+    assert billing_mod._monthly_credit_limit() == 1000.0
+
+
+def test_invalid_credit_limit_env_falls_back(monkeypatch):
+    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CREDIT_LIMIT", "bogus")
+    assert billing_mod._monthly_credit_limit() == 1000.0
+    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CREDIT_LIMIT", "-5")
+    assert billing_mod._monthly_credit_limit() == 1000.0
+
+
 def test_subscriber_under_cap_200_and_counted(stubbed_backends, monkeypatch, tmp_path):
     _enable_x402(monkeypatch)
     _enable_stripe(monkeypatch, tmp_path)
-    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CALL_LIMIT", "3")
+    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CREDIT_LIMIT", "10")
     _fake_facilitator(monkeypatch, valid=True)
     token = _subscriber_token("cus_cap1")
 
@@ -532,20 +556,40 @@ def test_subscriber_under_cap_200_and_counted(stubbed_backends, monkeypatch, tmp
         r = xc.post("/search", json={"query": "q"}, headers={"X-Subscriber-Key": token})
         assert r.status_code == 200, r.text
 
-    month, calls = _usage_row(tmp_path)
-    assert calls == 3
+    # A $0.025 search deducts 2.5 credits: 3 x 2.5 = 7.5.
+    month, credits = _usage_row(tmp_path)
+    assert credits == 7.5
     assert month == billing_mod._current_month_utc()
+
+
+def test_fractional_deduction_mixed_tools(stubbed_backends, monkeypatch, tmp_path):
+    _enable_x402(monkeypatch)
+    _enable_stripe(monkeypatch, tmp_path)
+    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CREDIT_LIMIT", "100")
+    _fake_facilitator(monkeypatch, valid=True)
+    token = _subscriber_token("cus_frac")
+    headers = {"X-Subscriber-Key": token}
+
+    xc = TestClient(create_app())
+    assert xc.post("/search", json={"query": "q"}, headers=headers).status_code == 200
+    assert (
+        xc.post("/fetch", json={"url": "https://example.com/x"}, headers=headers).status_code == 200
+    )
+
+    # search_web = 2.5 credits, fetch_url = 1.0 credit.
+    assert _usage_row(tmp_path)[1] == 3.5
 
 
 def test_subscriber_over_cap_429(stubbed_backends, monkeypatch, tmp_path):
     _enable_x402(monkeypatch)
     _enable_stripe(monkeypatch, tmp_path)
-    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CALL_LIMIT", "2")
+    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CREDIT_LIMIT", "5")
     _fake_facilitator(monkeypatch, valid=True)
     token = _subscriber_token("cus_cap2")
 
     xc = TestClient(create_app())
     headers = {"X-Subscriber-Key": token}
+    # Two searches = 2 x 2.5 = 5.0 credits: exactly the cap.
     assert xc.post("/search", json={"query": "q"}, headers=headers).status_code == 200
     assert xc.post("/search", json={"query": "q"}, headers=headers).status_code == 200
 
@@ -553,24 +597,26 @@ def test_subscriber_over_cap_429(stubbed_backends, monkeypatch, tmp_path):
     assert r.status_code == 429, r.text
     body = r.json()
     assert body["error"] == "subscriber_monthly_cap_exceeded"
-    assert body["limit"] == 2
-    assert body["used"] == 2
+    assert body["credits_used"] == 5.0
+    assert body["credit_limit"] == 5.0
     assert body["resets_at"].endswith("-01T00:00:00Z")
     assert "x402" in body["message"]
-    # The denied call is never counted: usage stays at the cap.
-    assert _usage_row(tmp_path)[1] == 2
+    assert "X-Payment" in body["message"]
+    # The denied call is never charged: usage stays at the cap.
+    assert _usage_row(tmp_path)[1] == 5.0
 
 
 def test_month_rollover_resets_counter(stubbed_backends, monkeypatch, tmp_path):
     _enable_x402(monkeypatch)
     _enable_stripe(monkeypatch, tmp_path)
-    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CALL_LIMIT", "1")
+    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CREDIT_LIMIT", "2.5")
     monkeypatch.setattr(billing_mod, "_current_month_utc", lambda: "2026-08")
     _fake_facilitator(monkeypatch, valid=True)
     token = _subscriber_token("cus_cap3")
 
     xc = TestClient(create_app())
     headers = {"X-Subscriber-Key": token}
+    # One search = 2.5 credits: exactly the cap.
     assert xc.post("/search", json={"query": "q"}, headers=headers).status_code == 200
     r = xc.post("/search", json={"query": "q"}, headers=headers)
     assert r.status_code == 429, r.text
@@ -580,18 +626,18 @@ def test_month_rollover_resets_counter(stubbed_backends, monkeypatch, tmp_path):
     monkeypatch.setattr(billing_mod, "_current_month_utc", lambda: "2026-09")
     r = xc.post("/search", json={"query": "q"}, headers=headers)
     assert r.status_code == 200, r.text
-    assert _usage_row(tmp_path) == ("2026-09", 1)
+    assert _usage_row(tmp_path) == ("2026-09", 2.5)
 
 
 def test_x402_payers_not_capped(stubbed_backends, monkeypatch, tmp_path):
     _enable_x402(monkeypatch)
     _enable_stripe(monkeypatch, tmp_path)
-    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CALL_LIMIT", "1")
+    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CREDIT_LIMIT", "2.5")
     _fake_facilitator(monkeypatch, valid=True)
     token = _subscriber_token("cus_cap4")
 
     xc = TestClient(create_app())
-    # Burn the subscriber's whole cap...
+    # Burn the subscriber's whole credit cap...
     assert (
         xc.post("/search", json={"query": "q"}, headers={"X-Subscriber-Key": token}).status_code
         == 200
@@ -604,7 +650,7 @@ def test_x402_payers_not_capped(stubbed_backends, monkeypatch, tmp_path):
 def test_mcp_subscriber_key_covered_by_cap(stubbed_backends, monkeypatch, tmp_path):
     _enable_x402(monkeypatch)
     _enable_stripe(monkeypatch, tmp_path)
-    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CALL_LIMIT", "1")
+    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CREDIT_LIMIT", "1")
     _fake_facilitator(monkeypatch, valid=True)
     token = _subscriber_token("cus_cap5")
 
@@ -619,8 +665,88 @@ def test_mcp_subscriber_key_covered_by_cap(stubbed_backends, monkeypatch, tmp_pa
     # NOTE: the FastMCP app needs the TestClient lifespan context; plain
     # TestClient(...) without `with` leaves the session manager unstarted.
     with xc:
+        # fetch_url = $0.01 -> 1.0 credit: exactly the cap.
         r = xc.post("/mcp", json=body, headers=headers)
         assert r.status_code == 200, r.text
         r = xc.post("/mcp", json=body, headers=headers)
         assert r.status_code == 429, r.text
         assert r.json()["error"] == "subscriber_monthly_cap_exceeded"
+        assert r.json()["credits_used"] == 1.0
+
+
+def test_free_paths_cost_zero_and_are_never_gated(stubbed_backends, monkeypatch, tmp_path):
+    """tools/list (free in the x402 price map) costs 0 credits and is never
+    429-gated, even when the subscriber's credit cap is exhausted."""
+    _enable_x402(monkeypatch)
+    _enable_stripe(monkeypatch, tmp_path)
+    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CREDIT_LIMIT", "2.5")
+    _fake_facilitator(monkeypatch, valid=True)
+    token = _subscriber_token("cus_free")
+
+    xc = TestClient(create_app())
+    headers = {"X-Subscriber-Key": token}
+    # Burn the whole cap on one search (2.5 credits).
+    assert xc.post("/search", json={"query": "q"}, headers=headers).status_code == 200
+    assert xc.post("/search", json={"query": "q"}, headers=headers).status_code == 429
+
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+    with xc:
+        r = xc.post("/mcp", json=body, headers=headers)
+        assert r.status_code == 200, r.text
+    # No credits charged for the free call.
+    assert _usage_row(tmp_path)[1] == 2.5
+
+
+def test_billing_usage_endpoint(stubbed_backends, monkeypatch, tmp_path):
+    _enable_x402(monkeypatch)
+    _enable_stripe(monkeypatch, tmp_path)
+    _fake_facilitator(monkeypatch, valid=True)
+    token = _subscriber_token("cus_usage")
+
+    xc = TestClient(create_app())
+    headers = {"X-Subscriber-Key": token}
+    # Free even with x402 live: billing routes are exempt from 402s.
+    r = xc.get("/billing/usage", headers=headers)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body == {
+        "credits_used": 0.0,
+        "credit_limit": 1000.0,
+        "resets_at": body["resets_at"],
+        "period": billing_mod._current_month_utc(),
+    }
+    assert body["resets_at"].endswith("-01T00:00:00Z")
+
+    assert xc.post("/search", json={"query": "q"}, headers=headers).status_code == 200
+    r = xc.get("/billing/usage", headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["credits_used"] == 2.5
+
+    # Unknown key -> 401, not a 402 or 429.
+    assert xc.get("/billing/usage", headers={"X-Subscriber-Key": "nope"}).status_code == 401
+
+
+def test_billing_usage_never_429_gated(stubbed_backends, monkeypatch, tmp_path):
+    """GET /billing/usage stays readable even after the cap is exhausted."""
+    _enable_x402(monkeypatch)
+    _enable_stripe(monkeypatch, tmp_path)
+    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CREDIT_LIMIT", "2.5")
+    _fake_facilitator(monkeypatch, valid=True)
+    token = _subscriber_token("cus_usage2")
+
+    xc = TestClient(create_app())
+    headers = {"X-Subscriber-Key": token}
+    assert xc.post("/search", json={"query": "q"}, headers=headers).status_code == 200
+    assert xc.post("/search", json={"query": "q"}, headers=headers).status_code == 429
+
+    r = xc.get("/billing/usage", headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["credits_used"] == 2.5
+
+
+def test_billing_usage_404_when_stripe_disabled(monkeypatch, tmp_path):
+    monkeypatch.delenv("STRIPE_ENABLED", raising=False)
+    monkeypatch.setenv("BILLING_DB_PATH", str(tmp_path / "subs.db"))
+    xc = TestClient(create_app())
+    r = xc.get("/billing/usage", headers={"X-Subscriber-Key": "whatever"})
+    assert r.status_code == 404

@@ -53,7 +53,7 @@ curl localhost:8000/health
 | `STRIPE_ENABLED` | `false` | Monthly subscriber plans. Requires `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_ID` (create the product/price in the Stripe dashboard) |
 | `STRIPE_SUCCESS_URL` / `STRIPE_CANCEL_URL` | unset | Checkout redirect URLs (success URL should include `?session_id={CHECKOUT_SESSION_ID}`) |
 | `BILLING_DB_PATH` | `/var/lib/search-mcp/billing.db` | SQLite subscriber store (only key hashes are stored). Must sit on the Render persistent disk (`render.yaml` `disk:` stanza); when developing locally, set this to `./data/subscribers.db` since `/var/lib` usually isn't writable |
-| `SUBSCRIBER_MONTHLY_CALL_LIMIT` | `1000` | Pro fair-use cap: max calls per subscriber key per calendar month (UTC). Over the cap → HTTP 429 (x402 per-call still works). At ~$0.02 avg per-call, $9/mo ≈ 450 calls break-even — Scott's call on the number |
+| `SUBSCRIBER_MONTHLY_CREDIT_LIMIT` | `1000` | Pro fair-use cap: max credits per subscriber key per calendar month (UTC). 1 credit = $0.01 of x402 list price, so 1000 credits = $10 of API calls bundled with the $9/mo plan. Over the cap → HTTP 429 (x402 per-call still works) — Scott's call on the number |
 | `RATE_LIMIT` | `60/minute` | e.g. `600/hour` |
 
 ## Billing endpoints
@@ -61,10 +61,11 @@ curl localhost:8000/health
 - `POST /billing/checkout` → `{"checkout_url": ...}` (Stripe Checkout, subscription mode)
 - `POST /billing/stripe-webhook` → Stripe event receiver (activates/deactivates subscribers)
 - `GET /billing/key?session_id=...` → exchange a completed checkout for a subscriber key
+- `GET /billing/usage` → `{"credits_used","credit_limit","resets_at","period"}` for the caller's `X-Subscriber-Key` (free; never 402- or 429-gated)
 - `GET /billing/status` → `{"stripe_enabled","x402_enabled"}` (no secrets)
 
 Subscribers send `X-Subscriber-Key: <key>` instead of `X-Payment`.
-Subscriber-key calls count against the monthly fair-use cap (`SUBSCRIBER_MONTHLY_CALL_LIMIT`, default 1000/month UTC); over the cap returns HTTP 429 with `limit`, `used`, and `resets_at` — paying per call via x402 still works.
+Subscriber-key calls spend credits from the monthly fair-use cap (`SUBSCRIBER_MONTHLY_CREDIT_LIMIT`, default 1000/month UTC) — 1 credit = $0.01 of x402 list price (a search = 2.5 credits, a fetch = 1.0). Over the cap returns HTTP 429 with `credits_used`, `credit_limit`, and `resets_at` — paying per call via x402 still works.
 
 ## Deploy
 
