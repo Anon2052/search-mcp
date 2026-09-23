@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-test-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+          pip install -e .
+
+      - name: Secrets scan (fail on suspected secrets)
+        run: |
+          ! grep -rEn --exclude-dir=.venv --exclude-dir=.git \
+            -e '-----BEGIN (RSA |OPENSSH |EC )?PRIVATE KEY-----' \
+            -e 'AKIA[0-9A-Z]{16}' \
+            -e 'ghp_[0-9A-Za-z]{36}' \
+            -e 'gho_[0-9A-Za-z]{36}' \
+            -e 'sk-[A-Za-z0-9]{20,}' \
+            -e 'xox[bap]-[0-9A-Za-z-]{10,}' \
+            . || (echo 'POSSIBLE SECRET FOUND' && exit 1)
+
+      - name: Lint (ruff)
+        run: ruff check src tests
+
+      - name: Format check (ruff)
+        run: ruff format --check src tests
+
+      - name: Tests (pytest)
+        run: python -m pytest -q
+
+      - name: Vulnerability audit (pip-audit)
+        run: pip-audit -r requirements.txt
