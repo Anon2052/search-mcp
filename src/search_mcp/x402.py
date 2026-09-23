@@ -58,7 +58,7 @@ FACILITATOR_TIMEOUT_SECONDS = 15.0
 # exempt separately in the middleware: Stripe's webhooks cannot attach an
 # X-Payment header, and requiring per-call payment for checkout would be
 # circular for new subscribers.
-EXEMPT_PREFIXES = ("/health", "/docs", "/redoc", "/openapi.json", "/favicon.ico")
+EXEMPT_PREFIXES = ("/health", "/docs", "/redoc", "/openapi.json", "/favicon.ico", "/legal")
 
 # REST route -> tool name (per-repo map).
 REST_PRICE_MAP = {

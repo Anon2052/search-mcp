@@ -17,6 +17,7 @@ from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
+from starlette.responses import Response
 from starlette.routing import Route
 
 from . import __version__
@@ -25,6 +26,7 @@ from . import search as _search
 from .billing import router as billing_router
 from .billing import stripe_effective_enabled
 from .fetch import FetchError
+from .legal_docs import PRIVACY_POLICY, REFUND_POLICY, TERMS_OF_SERVICE
 from .mcp_server import mcp
 from .search import SearchError
 from .x402 import X402PaymentMiddleware, warn_if_payments_live, x402_effective_enabled
@@ -119,6 +121,21 @@ def create_app(rate_limit: str | None = None) -> FastAPI:
         }
 
     app.include_router(billing_router)
+
+    # Public legal documents (Stripe onboarding URLs). No rate limit, hidden
+    # from the OpenAPI schema, and never x402-metered (x402.py exempts the
+    # /legal prefix). Content served verbatim from .legal_docs.
+    @app.get("/legal/terms", include_in_schema=False)
+    async def legal_terms():
+        return Response(content=TERMS_OF_SERVICE, media_type="text/markdown; charset=utf-8")
+
+    @app.get("/legal/privacy", include_in_schema=False)
+    async def legal_privacy():
+        return Response(content=PRIVACY_POLICY, media_type="text/markdown; charset=utf-8")
+
+    @app.get("/legal/refunds", include_in_schema=False)
+    async def legal_refunds():
+        return Response(content=REFUND_POLICY, media_type="text/markdown; charset=utf-8")
 
     @app.post("/search")
     @limiter.limit(limit)
