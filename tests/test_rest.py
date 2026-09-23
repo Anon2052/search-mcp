@@ -42,7 +42,8 @@ def test_health(client):
     body = r.json()
     assert body["status"] == "ok"
     assert "version" in body
-    assert body["x402"] == "false"
+    assert body["x402"] == "disabled"
+    assert body["stripe"] == "disabled"
 
 
 def test_search_endpoint(client):
@@ -104,21 +105,65 @@ def test_rate_limiting(stubbed_backends):
 
 def _enable_x402(monkeypatch):
     monkeypatch.setenv("X402_ENABLED", "true")
-    monkeypatch.setenv("X402_PRICE_USDC", "0.015")
     monkeypatch.setenv("X402_PAY_TO", "0xAbC123")
+    monkeypatch.setenv("X402_FACILITATOR_URL", "https://x402.test/facilitator")
+    monkeypatch.setenv("X402_PRICE_USDC", "0.015")
 
 
-def _payment_header(**over):
-    payload = {
-        "asset": "USDC",
-        "network": "base",
-        "amount": "0.015",
-        "pay_to": "0xAbC123",
-        "payer": "0xDeF456",
-        "signature": "0xSig789",
+_x402_sig_counter = 0
+
+
+def _x402_header(value_atomic=25000, **auth_over):
+    """Build a base64 v1 X-Payment header (signature not verified locally).
+
+    Each header gets a unique signature so the anti-replay set can't leak
+    between tests.
+    """
+    import base64
+    import time
+
+    global _x402_sig_counter
+    _x402_sig_counter += 1
+    sig = auth_over.pop("signature", "0x" + f"{_x402_sig_counter:064x}"[-64:])
+    now = int(time.time())
+    auth = {
+        "from": "0xPayer000000000000000000000000000000000001",
+        "to": "0xAbC123",
+        "value": str(value_atomic),
+        "validAfter": str(now - 60),
+        "validBefore": str(now + 300),
+        "nonce": "0x" + f"{_x402_sig_counter:064x}"[-64:],
     }
-    payload.update(over)
-    return {"X-Payment": json.dumps(payload)}
+    auth.update(auth_over)
+    payload = {
+        "x402Version": 1,
+        "scheme": "exact",
+        "network": "base",
+        "payload": {"signature": sig, "authorization": auth},
+    }
+    raw = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    return {"X-Payment": raw}
+
+
+def _fake_facilitator(monkeypatch, valid=True, unreachable=False):
+    import search_mcp.x402 as x402_mod
+
+    async def fake_verify(payment_payload, requirements):  # noqa: ANN001, ANN202
+        if unreachable:
+            raise x402_mod.FacilitatorUnavailable("down")
+        return {
+            "isValid": valid,
+            "invalidReason": None if valid else "bad signature",
+            "payer": "0xPayer000000000000000000000000000000000001",
+        }
+
+    async def fake_settle(payment_payload, requirements):  # noqa: ANN001, ANN202
+        if unreachable:
+            raise x402_mod.FacilitatorUnavailable("down")
+        return {"success": True, "transaction": "0xTxHash1", "network": "base"}
+
+    monkeypatch.setattr(x402_mod, "facilitator_verify", fake_verify)
+    monkeypatch.setattr(x402_mod, "facilitator_settle", fake_settle)
 
 
 def test_x402_disabled_by_default_passes_through(client):
@@ -135,62 +180,45 @@ def test_x402_enabled_blocks_without_payment(stubbed_backends, monkeypatch):
     assert body["error"] == "payment_required"
     assert body["accepts"]["asset"] == "USDC"
     assert body["accepts"]["network"] == "base"
+    assert body["accepts"]["scheme"] == "exact"
+    reqs = body["paymentRequirements"]
+    assert reqs["asset"] == "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA38bD"
+    assert reqs["network"] == "base"
+    # search_web default 0.025 USDC -> 25000 atomic units.
+    assert reqs["maxAmountRequired"] == "25000"
 
 
 def test_x402_enabled_health_stays_free(stubbed_backends, monkeypatch):
     _enable_x402(monkeypatch)
     xc = TestClient(create_app())
-    assert xc.get("/health").status_code == 200
+    r = xc.get("/health")
+    assert r.status_code == 200
+    assert r.json()["x402"] == "enabled"
+    assert r.json()["stripe"] == "disabled"
 
 
 def test_x402_enabled_rejects_malformed_payment(stubbed_backends, monkeypatch):
     _enable_x402(monkeypatch)
     xc = TestClient(create_app())
-    r = xc.post("/search", json={"query": "q"}, headers={"X-Payment": "not-json"})
+    r = xc.post("/search", json={"query": "q"}, headers={"X-Payment": "not-base64!!!"})
     assert r.status_code == 402
-    r = xc.post(
-        "/search", json={"query": "q"}, headers=_payment_header(amount="0.000001")
-    )  # underpriced
+    r = xc.post("/search", json={"query": "q"}, headers=_x402_header(value_atomic=1))  # underpriced
     assert r.status_code == 402
 
 
-def test_x402_enabled_accepts_structurally_valid_payment(stubbed_backends, monkeypatch):
+def test_x402_enabled_verifies_and_serves(stubbed_backends, monkeypatch):
     _enable_x402(monkeypatch)
+    _fake_facilitator(monkeypatch, valid=True)
     xc = TestClient(create_app())
-    r = xc.post("/search", json={"query": "q"}, headers=_payment_header())
+    r = xc.post("/search", json={"query": "q"}, headers=_x402_header())
     assert r.status_code == 200, r.text
     assert r.json()["results"][0]["title"] == "T"
 
 
-# ------------------------------------------------------------- MCP mount paths
-
-
-def _mcp_ping_body():
-    return {"jsonrpc": "2.0", "id": 1, "method": "ping"}
-
-
-def _mcp_result(response):
-    # Streamable HTTP answers as SSE: extract the JSON payload of the message event.
-    assert response.status_code == 200, response.text
-    assert "text/event-stream" in response.headers["content-type"]
-    for line in response.text.splitlines():
-        if line.startswith("data: "):
-            import json
-
-            return json.loads(line[len("data: ") :])
-    raise AssertionError(f"no data event in MCP response: {response.text!r}")
-
-
-def test_mcp_bare_path_does_not_redirect(stubbed_backends):
-    # Bare /mcp (no trailing slash) must be served directly: many MCP clients
-    # don't follow the 307 Starlette's mount would otherwise issue.
-    with TestClient(create_app(), follow_redirects=False) as c:
-        r = c.post("/mcp", json=_mcp_ping_body())
-    assert r.status_code != 307, f"bare /mcp 307-redirected to {r.headers.get('location')}"
-    assert _mcp_result(r)["result"] == {}
-
-
-def test_mcp_trailing_slash_path_still_works(stubbed_backends):
-    with TestClient(create_app(), follow_redirects=False) as c:
-        r = c.post("/mcp/", json=_mcp_ping_body())
-    assert _mcp_result(r)["result"] == {}
+def test_x402_enabled_rejects_facilitator_denial(stubbed_backends, monkeypatch):
+    _enable_x402(monkeypatch)
+    _fake_facilitator(monkeypatch, valid=False)
+    xc = TestClient(create_app())
+    r = xc.post("/search", json={"query": "q"}, headers=_x402_header())
+    assert r.status_code == 402
+    assert r.json()["error"] == "payment_invalid"

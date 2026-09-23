@@ -6,3 +6,5 @@ uvicorn==0.53.0
 slowapi==0.1.10
 httpx==0.28.1
 tavily-python==0.8.4
+stripe==15.6.1
+cryptography==50.0.1
