@@ -469,13 +469,17 @@ class X402PaymentMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         # Stripe subscriber bypass (invalid keys fall through to x402, not a
-        # hard error). Valid subscriber keys count against the monthly
-        # fair-use cap; x402 per-call payers are never capped.
-        from .billing import check_subscriber_usage
+        # hard error). Valid subscriber keys spend credits from the monthly
+        # fair-use cap — the credit cost derives from the same x402 price
+        # map used below (free paths cost 0 and are never gated). x402
+        # per-call payers are never capped.
+        from .billing import check_subscriber_usage, credits_for_price_usdc
 
         sub_key = request.headers.get("x-subscriber-key", "").strip()
         if sub_key:
-            verdict = check_subscriber_usage(sub_key)
+            price = await _resolve_price(request)
+            credit_cost = 0.0 if price is None else credits_for_price_usdc(price)
+            verdict = check_subscriber_usage(sub_key, credit_cost)
             if verdict is not None:
                 if not verdict["ok"]:
                     return JSONResponse(
@@ -483,13 +487,16 @@ class X402PaymentMiddleware(BaseHTTPMiddleware):
                         content={
                             "error": "subscriber_monthly_cap_exceeded",
                             "message": (
-                                f"Pro monthly fair-use cap reached "
-                                f"({verdict['used']} of {verdict['limit']} calls used). "
+                                f"Pro monthly fair-use credit cap reached "
+                                f"({verdict['credits_used']} of "
+                                f"{verdict['credit_limit']} credits used). "
                                 f"Usage resets on {verdict['resets_at']}. "
-                                "Per-call x402 payment still works for extra usage."
+                                "Per-call x402 payment still works for extra "
+                                "usage: resend without X-Subscriber-Key and "
+                                "include a signed X-Payment header."
                             ),
-                            "limit": verdict["limit"],
-                            "used": verdict["used"],
+                            "credits_used": verdict["credits_used"],
+                            "credit_limit": verdict["credit_limit"],
                             "resets_at": verdict["resets_at"],
                         },
                     )

@@ -11,9 +11,12 @@ Env:
     BILLING_DB_PATH (default "/var/lib/search-mcp/billing.db" — the Render
         persistent-disk mount; parent dir is created). Override locally with
         e.g. "./data/subscribers.db" when developing outside Render.
-    SUBSCRIBER_MONTHLY_CALL_LIMIT (default "1000"): fair-use cap on calls
-        authenticated with X-Subscriber-Key, per calendar month (UTC).
-        x402 per-call payers are not capped.
+    SUBSCRIBER_MONTHLY_CREDIT_LIMIT (default "1000"): fair-use credit cap
+        on calls authenticated with X-Subscriber-Key, per calendar month
+        (UTC). 1 credit = $0.01 of x402 list price, so 1000 credits = $10 of
+        API calls bundled with the $9/mo Pro plan (Scott's call on the
+        number; override with the env var). x402 per-call payers are not
+        capped.
 
 Subscriber storage: stdlib sqlite3. Only the SHA-256 hash of a subscriber
 key is stored — never the raw token. All endpoints 404 unless Stripe is
@@ -28,6 +31,7 @@ import os
 import secrets
 import sqlite3
 import time
+from decimal import Decimal
 
 import stripe
 from fastapi import APIRouter, Request
@@ -52,7 +56,7 @@ CREATE TABLE IF NOT EXISTS subscribers (
 CREATE TABLE IF NOT EXISTS subscriber_usage (
     key_hash   TEXT PRIMARY KEY,
     month      TEXT NOT NULL,
-    calls      INTEGER NOT NULL DEFAULT 0,
+    credits    REAL NOT NULL DEFAULT 0,
     updated_at TEXT
 );
 """
@@ -61,9 +65,9 @@ CREATE TABLE IF NOT EXISTS subscriber_usage (
 # A redeploy would wipe ./data on Render's ephemeral filesystem.
 _DISK_DB_PATH = "/var/lib/search-mcp/billing.db"
 
-# Fair-use cap for Pro subscribers: at ~$0.02 avg per-call price, $9/mo
-# breaks even around 450 calls; 1000 gives headroom. Scott's call to change.
-_DEFAULT_MONTHLY_CALL_LIMIT = 1000
+# Fair-use credit cap for Pro subscribers: 1000 credits = $10 of API calls
+# at x402 list price, bundled with the $9/mo plan. Scott's call to change.
+_DEFAULT_MONTHLY_CREDIT_LIMIT = 1000.0
 
 _PLACEHOLDER_HASH = "pending:" + "0" * 56  # replaced by GET /billing/key
 
@@ -98,7 +102,23 @@ def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
+    _migrate_usage_to_credits(conn)
     return conn
+
+
+def _migrate_usage_to_credits(conn: sqlite3.Connection) -> None:
+    """One-way schema migration: subscriber_usage.calls -> credits.
+
+    The flat per-call cap was never enabled in production, so no real usage
+    data is at risk; the migration just keeps dev/staging DBs created by the
+    old code working with the credit-based cap.
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(subscriber_usage)")}
+    if "calls" in cols and "credits" not in cols:
+        conn.execute("ALTER TABLE subscriber_usage ADD COLUMN credits REAL NOT NULL DEFAULT 0")
+        conn.execute("ALTER TABLE subscriber_usage DROP COLUMN calls")
+        conn.commit()
+        log.info("migrated subscriber_usage.calls -> credits")
 
 
 def _now_iso() -> str:
@@ -195,19 +215,34 @@ def _current_month_utc() -> str:
     return time.strftime("%Y-%m", time.gmtime())
 
 
-def _monthly_call_limit() -> int:
-    raw = os.environ.get("SUBSCRIBER_MONTHLY_CALL_LIMIT", "").strip()
+def credits_for_price_usdc(price_usdc: Decimal | float | str) -> float:
+    """Credit cost of one call: 1 credit = $0.01 of x402 list price.
+
+    Takes the same Decimal price the x402 middleware charges (see
+    ``x402.price_for_tool_usdc``) — the x402 price map stays the single
+    source of truth; this only converts dollars to credits. $0.025 -> 2.5
+    credits, $0.01 -> 1.0 credit.
+    """
+    price = price_usdc if isinstance(price_usdc, Decimal) else Decimal(str(price_usdc))
+    return float(round(price / Decimal("0.01"), 1))
+
+
+def _monthly_credit_limit() -> float:
+    raw = os.environ.get("SUBSCRIBER_MONTHLY_CREDIT_LIMIT", "").strip()
     if not raw:
-        return _DEFAULT_MONTHLY_CALL_LIMIT
+        return _DEFAULT_MONTHLY_CREDIT_LIMIT
     try:
-        return int(raw)
+        value = float(raw)
+        if value <= 0:
+            raise ValueError
+        return value
     except ValueError:
         log.warning(
-            "invalid SUBSCRIBER_MONTHLY_CALL_LIMIT=%r; using default %d",
+            "invalid SUBSCRIBER_MONTHLY_CREDIT_LIMIT=%r; using default %g",
             raw,
-            _DEFAULT_MONTHLY_CALL_LIMIT,
+            _DEFAULT_MONTHLY_CREDIT_LIMIT,
         )
-        return _DEFAULT_MONTHLY_CALL_LIMIT
+        return _DEFAULT_MONTHLY_CREDIT_LIMIT
 
 
 def _next_month_start_iso() -> str:
@@ -221,23 +256,28 @@ def _next_month_start_iso() -> str:
     return f"{year:04d}-{month:02d}-01T00:00:00Z"
 
 
-def check_subscriber_usage(token: str) -> dict | None:
-    """Validate a subscriber key and record one call against the monthly
-    fair-use cap.
+def check_subscriber_usage(token: str, credit_cost: float) -> dict | None:
+    """Validate a subscriber key and charge one call's credit cost against
+    the monthly fair-use credit cap.
+
+    ``credit_cost`` is the credits for this call (see
+    credits_for_price_usdc, which converts the x402 price map's dollars to
+    credits). Free paths pass 0: they are never gated and never counted.
 
     Returns None when the key is invalid/unknown (the caller falls through
     to the normal x402 flow, not a hard error). Otherwise returns a verdict
     dict:
-        {"ok": True,  "limit": N, "used": n}                       (under cap; call counted)
-        {"ok": False, "limit": N, "used": n, "resets_at": "..."}   (cap hit; NOT counted)
-    The counter resets on the calendar-month boundary (UTC). Cap applies to
-    subscriber-key auth only — x402 per-call payers never touch this.
+        {"ok": True,  "credit_limit": L, "credits_used": n, "credit_cost": c}
+        {"ok": False, "credit_limit": L, "credits_used": n, "credit_cost": c,
+         "resets_at": "..."}                                     (cap hit; NOT charged)
+    The counter resets on the calendar-month boundary (UTC). The cap applies
+    to subscriber-key auth only — x402 per-call payers never touch this.
     """
     if not token:
         return None
     key_hash = _hash_key(token)
     month = _current_month_utc()
-    limit = _monthly_call_limit()
+    limit = _monthly_credit_limit()
     conn = _db()
     try:
         sub = conn.execute(
@@ -247,32 +287,84 @@ def check_subscriber_usage(token: str) -> dict | None:
         if sub is None:
             return None
         row = conn.execute(
-            "SELECT month, calls FROM subscriber_usage WHERE key_hash = ?",
+            "SELECT month, credits FROM subscriber_usage WHERE key_hash = ?",
             (key_hash,),
         ).fetchone()
-        used = row["calls"] if row is not None and row["month"] == month else 0
-        if used >= limit:
-            return {"ok": False, "limit": limit, "used": used, "resets_at": _next_month_start_iso()}
+        used = float(row["credits"]) if row is not None and row["month"] == month else 0.0
+        if credit_cost <= 0:
+            # Free path (discovery etc.): no charge, never gated.
+            return {
+                "ok": True,
+                "credit_limit": limit,
+                "credits_used": round(used, 1),
+                "credit_cost": 0.0,
+            }
+        if used + credit_cost > limit:
+            return {
+                "ok": False,
+                "credit_limit": limit,
+                "credits_used": round(used, 1),
+                "credit_cost": credit_cost,
+                "resets_at": _next_month_start_iso(),
+            }
         # Atomic upsert: reset the counter when the stored month is stale.
         # In ON CONFLICT DO UPDATE, right-hand sides see the OLD row, so the
         # CASE compares the stored month against the incoming one.
         conn.execute(
             """
-            INSERT INTO subscriber_usage (key_hash, month, calls, updated_at)
-            VALUES (?, ?, 1, ?)
+            INSERT INTO subscriber_usage (key_hash, month, credits, updated_at)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(key_hash) DO UPDATE SET
                 month = excluded.month,
-                calls = CASE
+                credits = CASE
                     WHEN subscriber_usage.month = excluded.month
-                    THEN subscriber_usage.calls + 1
-                    ELSE 1
+                    THEN subscriber_usage.credits + excluded.credits
+                    ELSE excluded.credits
                 END,
                 updated_at = excluded.updated_at
             """,
-            (key_hash, month, _now_iso()),
+            (key_hash, month, credit_cost, _now_iso()),
         )
         conn.commit()
-        return {"ok": True, "limit": limit, "used": used + 1}
+        return {
+            "ok": True,
+            "credit_limit": limit,
+            "credits_used": round(used + credit_cost, 1),
+            "credit_cost": credit_cost,
+        }
+    finally:
+        conn.close()
+
+
+def get_subscriber_credit_usage(token: str) -> dict | None:
+    """Current credit usage for a subscriber key. None if invalid/unknown.
+
+    Read-only: never charges the cap and never 429s, so the /billing/usage
+    endpoint can serve it freely.
+    """
+    if not token:
+        return None
+    key_hash = _hash_key(token)
+    month = _current_month_utc()
+    conn = _db()
+    try:
+        sub = conn.execute(
+            "SELECT 1 FROM subscribers WHERE key_hash = ? AND status = 'active'",
+            (key_hash,),
+        ).fetchone()
+        if sub is None:
+            return None
+        row = conn.execute(
+            "SELECT month, credits FROM subscriber_usage WHERE key_hash = ?",
+            (key_hash,),
+        ).fetchone()
+        used = float(row["credits"]) if row is not None and row["month"] == month else 0.0
+        return {
+            "credits_used": round(used, 1),
+            "credit_limit": _monthly_credit_limit(),
+            "resets_at": _next_month_start_iso(),
+            "period": month,
+        }
     finally:
         conn.close()
 
@@ -395,6 +487,22 @@ async def get_key(session_id: str) -> JSONResponse:
     if token is None:
         return JSONResponse(status_code=500, content={"error": "key_issue_failed"})
     return JSONResponse(status_code=200, content={"subscriber_key": token})
+
+
+@router.get("/usage")
+async def usage(request: Request) -> JSONResponse:
+    """Credit usage for the caller's subscriber key (X-Subscriber-Key).
+
+    Free: the x402 middleware exempts /billing/*, and this endpoint never
+    charges or 429-gates — it only reads.
+    """
+    if not stripe_effective_enabled():
+        return _not_found()
+    token = request.headers.get("x-subscriber-key", "").strip()
+    info = get_subscriber_credit_usage(token)
+    if info is None:
+        return JSONResponse(status_code=401, content={"error": "invalid_subscriber_key"})
+    return JSONResponse(status_code=200, content=info)
 
 
 @router.get("/status")
