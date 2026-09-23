@@ -53,6 +53,7 @@ curl localhost:8000/health
 | `STRIPE_ENABLED` | `false` | Monthly subscriber plans. Requires `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_ID` (create the product/price in the Stripe dashboard) |
 | `STRIPE_SUCCESS_URL` / `STRIPE_CANCEL_URL` | unset | Checkout redirect URLs (success URL should include `?session_id={CHECKOUT_SESSION_ID}`) |
 | `BILLING_DB_PATH` | `/var/lib/search-mcp/billing.db` | SQLite subscriber store (only key hashes are stored). Must sit on the Render persistent disk (`render.yaml` `disk:` stanza); when developing locally, set this to `./data/subscribers.db` since `/var/lib` usually isn't writable |
+| `SUBSCRIBER_MONTHLY_CALL_LIMIT` | `1000` | Pro fair-use cap: max calls per subscriber key per calendar month (UTC). Over the cap → HTTP 429 (x402 per-call still works). At ~$0.02 avg per-call, $9/mo ≈ 450 calls break-even — Scott's call on the number |
 | `RATE_LIMIT` | `60/minute` | e.g. `600/hour` |
 
 ## Billing endpoints
@@ -63,6 +64,7 @@ curl localhost:8000/health
 - `GET /billing/status` → `{"stripe_enabled","x402_enabled"}` (no secrets)
 
 Subscribers send `X-Subscriber-Key: <key>` instead of `X-Payment`.
+Subscriber-key calls count against the monthly fair-use cap (`SUBSCRIBER_MONTHLY_CALL_LIMIT`, default 1000/month UTC); over the cap returns HTTP 429 with `limit`, `used`, and `resets_at` — paying per call via x402 still works.
 
 ## Deploy
 
