@@ -417,6 +417,7 @@ cryptography==50.0.1 \
     --hash=sha256:fd3718b960d0b5dd213cdf03f3bcb7000e69dda0de8b956061947ff6bcff5558 \
     --hash=sha256:ff838d62ec1bfce4f9ba7fa16f4a7b554cd8d0c299e6be37502161a660c84eef
     # via
+    #   -r requirements.in
     #   authlib
     #   joserfc
     #   pyjwt
@@ -983,6 +984,7 @@ requests==2.34.2 \
     --hash=sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0 \
     --hash=sha256:f288924cae4e29463698d6d60bc6a4da69c89185ad1e0bcc4104f584e960b9ed
     # via
+    #   stripe
     #   tavily-python
     #   tiktoken
 rich==15.0.0 \
@@ -1136,6 +1138,10 @@ starlette==1.6.0 \
     #   fastmcp-slim
     #   mcp
     #   sse-starlette
+stripe==15.6.1 \
+    --hash=sha256:9f3986aa960419041aba9c76191746bdf2c342c95892acfbf6edb500ab006d31 \
+    --hash=sha256:b33e1ea76462d7289e5fe755a1132b82099151bfb31e961021655471e6d216bf
+    # via -r requirements.in
 tavily-python==0.8.4 \
     --hash=sha256:1cbbb6d59ff22e3655586a1c8a1edf28d6abfa29d14da71dcd2922955da2033f \
     --hash=sha256:8031fd435e1c9580b7846044f456fc1d14b9c42b715740b3f0643a6e483abf83
@@ -1230,6 +1236,7 @@ typing-extensions==4.16.0 \
     #   pydantic-core
     #   referencing
     #   starlette
+    #   stripe
     #   typing-inspection
 typing-inspection==0.4.4 \
     --hash=sha256:547274fa6b0a561ccf549cc9524b999a578e737d015d8709d021f9d0d13bea47 \

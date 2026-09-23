@@ -24,9 +24,10 @@ The service is a single stateless container: FastAPI REST + FastMCP (streamable 
 | `SEARCH_API_KEY` | unset | **Required.** Tavily API key (free 1,000 credits/mo at tavily.com). `sync: false` in `render.yaml` → Render prompts at deploy |
 | `PORT` | `8000` | Injected automatically by Railway/Render/Fly — do not set manually |
 | `HOST` | `0.0.0.0` | |
-| `X402_ENABLED` | `false` | **Leave off.** On-chain payment verification is a structural stub, not prod-ready |
+| `X402_ENABLED` | `false` | Per-call x402 payments (facilitator-verified). **Leave off until** `X402_PAY_TO` + `X402_FACILITATOR_URL` are set, CDP keys are in place for mainnet, and the AZ LLC is formed |
+| `STRIPE_ENABLED` | `false` | Monthly subscriber plans. Requires `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_ID` from the Stripe dashboard |
 | `RATE_LIMIT` | `60/minute` | e.g. `600/hour` |
-| `X402_PRICE_USDC` / `X402_PAY_TO` | `0.015` / unset | Only relevant when x402 verification is real |
+| `X402_PRICE_USDC` / `X402_PAY_TO` | `0.015` / unset | `X402_PRICE_USDC` is the fallback; per-tool defaults (`X402_PRICE_SEARCH_WEB_USDC=0.025`, `X402_PRICE_FETCH_URL_USDC=0.01`) are proposed — Scott's call |
 
 No secrets are hardcoded in the image. `SEARCH_API_KEY` is supplied at deploy time.
 

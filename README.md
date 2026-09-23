@@ -16,7 +16,19 @@ Web search + URL fetch MCP server (streamable HTTP) + REST API. Connector #2 in 
 - `POST /fetch` → `{"url"}` → `{"text"}`
 - `POST /mcp` → MCP over streamable HTTP (stateless)
 
-60/min per-IP rate limit (`RATE_LIMIT`). x402 micropayment metering is a **structural stub** behind `X402_ENABLED=false` — no on-chain verification.
+60/min per-IP rate limit (`RATE_LIMIT`). Per-call payments via x402 (USDC on Base, facilitator-verified) and monthly plans via Stripe — **both OFF by default** (`X402_ENABLED=false`, `STRIPE_ENABLED=false`).
+
+## Pricing (proposed — Scott's call)
+
+| Tool / plan | Price | Mechanism |
+|---|---|---|
+| `search_web` | $0.025/call | x402 USDC on Base |
+| `fetch_url` | $0.01/call | x402 USDC on Base |
+| Pro Monthly | $9/mo | Stripe subscription → subscriber key bypasses per-call charges (fair use) |
+
+Per-tool prices are baked in as defaults but **overridable without a deploy**: `X402_PRICE_<TOOLNAME>_USDC` (e.g. `X402_PRICE_SEARCH_WEB_USDC=0.05`). `X402_PRICE_USDC` (default `0.015`) is the fallback for unmapped calls.
+
+MCP discovery (`initialize`, `tools/list`, `ping`, notifications) stays free so directory scanners keep working.
 
 ## Run locally
 
@@ -33,9 +45,24 @@ curl localhost:8000/health
 |---|---|---|
 | `SEARCH_API_KEY` | unset | **Required** for search. Never commit it. |
 | `PORT` / `HOST` | `8000` / `0.0.0.0` | `PORT` injected by the host |
-| `X402_ENABLED` | `false` | **Leave off** — stub, not prod-ready |
+| `X402_ENABLED` | `false` | Per-call x402 payments. **Leave off until** `X402_PAY_TO` + `X402_FACILITATOR_URL` are set, CDP keys are in place for mainnet, and the AZ LLC is formed |
+| `X402_PAY_TO` | unset | Your Base wallet address receiving USDC |
+| `X402_FACILITATOR_URL` | `https://x402.org/facilitator` | **Base Sepolia testnet only.** For Base mainnet: `https://api.cdp.coinbase.com/platform/v2/x402` + `CDP_API_KEY_ID`/`CDP_API_KEY_SECRET` |
+| `X402_FACILITATOR_API_KEY` | unset | Optional: `X-API-Key` auth for facilitators that use it |
+| `X402_PRICE_SEARCH_WEB_USDC` / `X402_PRICE_FETCH_URL_USDC` | `0.025` / `0.01` | Proposed defaults — Scott's call |
+| `STRIPE_ENABLED` | `false` | Monthly subscriber plans. Requires `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_ID` (create the product/price in the Stripe dashboard) |
+| `STRIPE_SUCCESS_URL` / `STRIPE_CANCEL_URL` | unset | Checkout redirect URLs (success URL should include `?session_id={CHECKOUT_SESSION_ID}`) |
+| `BILLING_DB_PATH` | `./data/subscribers.db` | SQLite subscriber store (only key hashes are stored) |
 | `RATE_LIMIT` | `60/minute` | e.g. `600/hour` |
-| `X402_PRICE_USDC` / `X402_PAY_TO` | `0.015` / unset | Only relevant when x402 verification is real |
+
+## Billing endpoints
+
+- `POST /billing/checkout` → `{"checkout_url": ...}` (Stripe Checkout, subscription mode)
+- `POST /billing/stripe-webhook` → Stripe event receiver (activates/deactivates subscribers)
+- `GET /billing/key?session_id=...` → exchange a completed checkout for a subscriber key
+- `GET /billing/status` → `{"stripe_enabled","x402_enabled"}` (no secrets)
+
+Subscribers send `X-Subscriber-Key: <key>` instead of `X-Payment`.
 
 ## Deploy
 
