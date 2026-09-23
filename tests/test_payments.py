@@ -495,3 +495,132 @@ def test_billing_status_no_secrets(stubbed_backends, monkeypatch, tmp_path):
     body = r.json()
     assert body == {"stripe_enabled": True, "x402_enabled": False}
     assert "sk_test" not in json.dumps(body)
+
+
+# --------------------------------- disk path + subscriber fair-use cap
+
+
+def _subscriber_token(customer_id):
+    billing_mod.upsert_subscriber_placeholder(customer_id, f"{customer_id}@x.io")
+    return billing_mod.rotate_subscriber_key(customer_id)
+
+
+def _usage_row(tmp_path):
+    import sqlite3
+
+    conn = sqlite3.connect(str(tmp_path / "subs.db"))
+    try:
+        return conn.execute("SELECT month, calls FROM subscriber_usage").fetchone()
+    finally:
+        conn.close()
+
+
+def test_db_default_path_is_disk_mount(monkeypatch):
+    monkeypatch.delenv("BILLING_DB_PATH", raising=False)
+    assert billing_mod._db_path() == "/var/lib/search-mcp/billing.db"
+
+
+def test_subscriber_under_cap_200_and_counted(stubbed_backends, monkeypatch, tmp_path):
+    _enable_x402(monkeypatch)
+    _enable_stripe(monkeypatch, tmp_path)
+    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CALL_LIMIT", "3")
+    _fake_facilitator(monkeypatch, valid=True)
+    token = _subscriber_token("cus_cap1")
+
+    xc = TestClient(create_app())
+    for _ in range(3):
+        r = xc.post("/search", json={"query": "q"}, headers={"X-Subscriber-Key": token})
+        assert r.status_code == 200, r.text
+
+    month, calls = _usage_row(tmp_path)
+    assert calls == 3
+    assert month == billing_mod._current_month_utc()
+
+
+def test_subscriber_over_cap_429(stubbed_backends, monkeypatch, tmp_path):
+    _enable_x402(monkeypatch)
+    _enable_stripe(monkeypatch, tmp_path)
+    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CALL_LIMIT", "2")
+    _fake_facilitator(monkeypatch, valid=True)
+    token = _subscriber_token("cus_cap2")
+
+    xc = TestClient(create_app())
+    headers = {"X-Subscriber-Key": token}
+    assert xc.post("/search", json={"query": "q"}, headers=headers).status_code == 200
+    assert xc.post("/search", json={"query": "q"}, headers=headers).status_code == 200
+
+    r = xc.post("/search", json={"query": "q"}, headers=headers)
+    assert r.status_code == 429, r.text
+    body = r.json()
+    assert body["error"] == "subscriber_monthly_cap_exceeded"
+    assert body["limit"] == 2
+    assert body["used"] == 2
+    assert body["resets_at"].endswith("-01T00:00:00Z")
+    assert "x402" in body["message"]
+    # The denied call is never counted: usage stays at the cap.
+    assert _usage_row(tmp_path)[1] == 2
+
+
+def test_month_rollover_resets_counter(stubbed_backends, monkeypatch, tmp_path):
+    _enable_x402(monkeypatch)
+    _enable_stripe(monkeypatch, tmp_path)
+    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CALL_LIMIT", "1")
+    monkeypatch.setattr(billing_mod, "_current_month_utc", lambda: "2026-08")
+    _fake_facilitator(monkeypatch, valid=True)
+    token = _subscriber_token("cus_cap3")
+
+    xc = TestClient(create_app())
+    headers = {"X-Subscriber-Key": token}
+    assert xc.post("/search", json={"query": "q"}, headers=headers).status_code == 200
+    r = xc.post("/search", json={"query": "q"}, headers=headers)
+    assert r.status_code == 429, r.text
+    assert r.json()["resets_at"] == "2026-09-01T00:00:00Z"
+
+    # Next month (UTC): the counter resets and the key works again.
+    monkeypatch.setattr(billing_mod, "_current_month_utc", lambda: "2026-09")
+    r = xc.post("/search", json={"query": "q"}, headers=headers)
+    assert r.status_code == 200, r.text
+    assert _usage_row(tmp_path) == ("2026-09", 1)
+
+
+def test_x402_payers_not_capped(stubbed_backends, monkeypatch, tmp_path):
+    _enable_x402(monkeypatch)
+    _enable_stripe(monkeypatch, tmp_path)
+    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CALL_LIMIT", "1")
+    _fake_facilitator(monkeypatch, valid=True)
+    token = _subscriber_token("cus_cap4")
+
+    xc = TestClient(create_app())
+    # Burn the subscriber's whole cap...
+    assert (
+        xc.post("/search", json={"query": "q"}, headers={"X-Subscriber-Key": token}).status_code
+        == 200
+    )
+    # ...but a per-call x402 payer on the same endpoint is unaffected.
+    r = xc.post("/search", json={"query": "q"}, headers=_x402_header())
+    assert r.status_code == 200, r.text
+
+
+def test_mcp_subscriber_key_covered_by_cap(stubbed_backends, monkeypatch, tmp_path):
+    _enable_x402(monkeypatch)
+    _enable_stripe(monkeypatch, tmp_path)
+    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CALL_LIMIT", "1")
+    _fake_facilitator(monkeypatch, valid=True)
+    token = _subscriber_token("cus_cap5")
+
+    body = {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/call",
+        "params": {"name": "fetch_url", "arguments": {"url": "https://example.com/"}},
+    }
+    xc = TestClient(create_app())
+    headers = {"X-Subscriber-Key": token}
+    # NOTE: the FastMCP app needs the TestClient lifespan context; plain
+    # TestClient(...) without `with` leaves the session manager unstarted.
+    with xc:
+        r = xc.post("/mcp", json=body, headers=headers)
+        assert r.status_code == 200, r.text
+        r = xc.post("/mcp", json=body, headers=headers)
+        assert r.status_code == 429, r.text
+        assert r.json()["error"] == "subscriber_monthly_cap_exceeded"

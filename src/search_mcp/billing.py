@@ -8,7 +8,12 @@ Env:
     STRIPE_ENABLED (default "false")
     STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_ID (required)
     STRIPE_SUCCESS_URL, STRIPE_CANCEL_URL (required for checkout)
-    BILLING_DB_PATH (default "./data/subscribers.db"; parent dir is created)
+    BILLING_DB_PATH (default "/var/lib/search-mcp/billing.db" — the Render
+        persistent-disk mount; parent dir is created). Override locally with
+        e.g. "./data/subscribers.db" when developing outside Render.
+    SUBSCRIBER_MONTHLY_CALL_LIMIT (default "1000"): fair-use cap on calls
+        authenticated with X-Subscriber-Key, per calendar month (UTC).
+        x402 per-call payers are not capped.
 
 Subscriber storage: stdlib sqlite3. Only the SHA-256 hash of a subscriber
 key is stored — never the raw token. All endpoints 404 unless Stripe is
@@ -32,6 +37,8 @@ log = logging.getLogger("search_mcp.billing")
 
 router = APIRouter(prefix="/billing")
 
+# Idempotent: CREATE TABLE IF NOT EXISTS runs on every _db() open, so the
+# first boot on a fresh Render disk works without a migration step.
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS subscribers (
     key_hash   TEXT PRIMARY KEY,
@@ -40,8 +47,23 @@ CREATE TABLE IF NOT EXISTS subscribers (
     status     TEXT,
     created_at TEXT,
     updated_at TEXT
-)
+);
+
+CREATE TABLE IF NOT EXISTS subscriber_usage (
+    key_hash   TEXT PRIMARY KEY,
+    month      TEXT NOT NULL,
+    calls      INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT
+);
 """
+
+# Default lives on the Render persistent-disk mount (see render.yaml `disk:`).
+# A redeploy would wipe ./data on Render's ephemeral filesystem.
+_DISK_DB_PATH = "/var/lib/search-mcp/billing.db"
+
+# Fair-use cap for Pro subscribers: at ~$0.02 avg per-call price, $9/mo
+# breaks even around 450 calls; 1000 gives headroom. Scott's call to change.
+_DEFAULT_MONTHLY_CALL_LIMIT = 1000
 
 _PLACEHOLDER_HASH = "pending:" + "0" * 56  # replaced by GET /billing/key
 
@@ -65,7 +87,7 @@ def stripe_effective_enabled() -> bool:
 
 
 def _db_path() -> str:
-    return os.environ.get("BILLING_DB_PATH", "./data/subscribers.db")
+    return os.environ.get("BILLING_DB_PATH", _DISK_DB_PATH)
 
 
 def _db() -> sqlite3.Connection:
@@ -75,7 +97,7 @@ def _db() -> sqlite3.Connection:
         os.makedirs(parent, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
-    conn.execute(_SCHEMA)
+    conn.executescript(_SCHEMA)
     return conn
 
 
@@ -163,6 +185,94 @@ def subscriber_key_valid(token: str) -> bool:
             (_hash_key(token),),
         ).fetchone()
         return row is not None
+    finally:
+        conn.close()
+
+
+def _current_month_utc() -> str:
+    """Current calendar month as "YYYY-MM" (UTC). Small and patchable so
+    tests can simulate the month boundary."""
+    return time.strftime("%Y-%m", time.gmtime())
+
+
+def _monthly_call_limit() -> int:
+    raw = os.environ.get("SUBSCRIBER_MONTHLY_CALL_LIMIT", "").strip()
+    if not raw:
+        return _DEFAULT_MONTHLY_CALL_LIMIT
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning(
+            "invalid SUBSCRIBER_MONTHLY_CALL_LIMIT=%r; using default %d",
+            raw,
+            _DEFAULT_MONTHLY_CALL_LIMIT,
+        )
+        return _DEFAULT_MONTHLY_CALL_LIMIT
+
+
+def _next_month_start_iso() -> str:
+    """First instant of next month, UTC, ISO-8601 — derived from the
+    patchable _current_month_utc() so tests control it."""
+    year, month = (int(part) for part in _current_month_utc().split("-"))
+    if month == 12:
+        year, month = year + 1, 1
+    else:
+        month += 1
+    return f"{year:04d}-{month:02d}-01T00:00:00Z"
+
+
+def check_subscriber_usage(token: str) -> dict | None:
+    """Validate a subscriber key and record one call against the monthly
+    fair-use cap.
+
+    Returns None when the key is invalid/unknown (the caller falls through
+    to the normal x402 flow, not a hard error). Otherwise returns a verdict
+    dict:
+        {"ok": True,  "limit": N, "used": n}                       (under cap; call counted)
+        {"ok": False, "limit": N, "used": n, "resets_at": "..."}   (cap hit; NOT counted)
+    The counter resets on the calendar-month boundary (UTC). Cap applies to
+    subscriber-key auth only — x402 per-call payers never touch this.
+    """
+    if not token:
+        return None
+    key_hash = _hash_key(token)
+    month = _current_month_utc()
+    limit = _monthly_call_limit()
+    conn = _db()
+    try:
+        sub = conn.execute(
+            "SELECT 1 FROM subscribers WHERE key_hash = ? AND status = 'active'",
+            (key_hash,),
+        ).fetchone()
+        if sub is None:
+            return None
+        row = conn.execute(
+            "SELECT month, calls FROM subscriber_usage WHERE key_hash = ?",
+            (key_hash,),
+        ).fetchone()
+        used = row["calls"] if row is not None and row["month"] == month else 0
+        if used >= limit:
+            return {"ok": False, "limit": limit, "used": used, "resets_at": _next_month_start_iso()}
+        # Atomic upsert: reset the counter when the stored month is stale.
+        # In ON CONFLICT DO UPDATE, right-hand sides see the OLD row, so the
+        # CASE compares the stored month against the incoming one.
+        conn.execute(
+            """
+            INSERT INTO subscriber_usage (key_hash, month, calls, updated_at)
+            VALUES (?, ?, 1, ?)
+            ON CONFLICT(key_hash) DO UPDATE SET
+                month = excluded.month,
+                calls = CASE
+                    WHEN subscriber_usage.month = excluded.month
+                    THEN subscriber_usage.calls + 1
+                    ELSE 1
+                END,
+                updated_at = excluded.updated_at
+            """,
+            (key_hash, month, _now_iso()),
+        )
+        conn.commit()
+        return {"ok": True, "limit": limit, "used": used + 1}
     finally:
         conn.close()
 

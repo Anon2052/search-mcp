@@ -469,12 +469,31 @@ class X402PaymentMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         # Stripe subscriber bypass (invalid keys fall through to x402, not a
-        # hard error).
-        from .billing import subscriber_key_valid
+        # hard error). Valid subscriber keys count against the monthly
+        # fair-use cap; x402 per-call payers are never capped.
+        from .billing import check_subscriber_usage
 
         sub_key = request.headers.get("x-subscriber-key", "").strip()
-        if sub_key and subscriber_key_valid(sub_key):
-            return await call_next(request)
+        if sub_key:
+            verdict = check_subscriber_usage(sub_key)
+            if verdict is not None:
+                if not verdict["ok"]:
+                    return JSONResponse(
+                        status_code=429,
+                        content={
+                            "error": "subscriber_monthly_cap_exceeded",
+                            "message": (
+                                f"Pro monthly fair-use cap reached "
+                                f"({verdict['used']} of {verdict['limit']} calls used). "
+                                f"Usage resets on {verdict['resets_at']}. "
+                                "Per-call x402 payment still works for extra usage."
+                            ),
+                            "limit": verdict["limit"],
+                            "used": verdict["used"],
+                            "resets_at": verdict["resets_at"],
+                        },
+                    )
+                return await call_next(request)
 
         price = await _resolve_price(request)
         if price is None:

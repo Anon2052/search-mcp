@@ -33,9 +33,20 @@ services:
         sync: false
       - key: STRIPE_CANCEL_URL
         sync: false
+      # BILLING_DB_PATH points at the persistent disk mount below. Set explicitly:
+      # Render does not remove env vars deleted from render.yaml, so omitting it
+      # would leave the live service pinned to the old ./data/subscribers.db path.
       - key: BILLING_DB_PATH
-        value: "./data/subscribers.db"
+        value: "/var/lib/search-mcp/billing.db"
       - key: RATE_LIMIT
         value: "60/minute"
       - key: SEARCH_API_KEY
         sync: false
+    # Persistent disk (1 GB = $0.25/mo) so the SQLite subscriber store
+    # survives redeploys. Without it, Render's ephemeral filesystem wipes
+    # paid subscriber keys on every deploy. Added via the service's Disk
+    # page in the dashboard — see PR body for the exact clicks.
+    disk:
+      name: search-mcp-data
+      mountPath: /var/lib/search-mcp
+      sizeGB: 1
