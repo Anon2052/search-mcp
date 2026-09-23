@@ -69,7 +69,7 @@ scogg3@gmail.com
 
 PRIVACY_POLICY = """# Privacy Policy
 
-**IOConnex LLC** ("we," "us," "our")
+**IOConnex LLC** (\"we,\" \"us,\" \"our\")
 Effective date: September 23, 2026 · Last updated: September 23, 2026
 
 > *Template document, not legal advice. Have an attorney review before relying on it.*
@@ -78,10 +78,10 @@ Effective date: September 23, 2026 · Last updated: September 23, 2026
 
 Our Services are APIs. We collect the minimum data necessary to operate them:
 
-- **Request metadata:** IP address, request path, timestamp, and user-agent, collected for rate limiting, abuse prevention, and operational logs.
+- **Request metadata:** IP address, request path, and timestamp, collected for rate limiting, abuse prevention, and operational logs.
 - **Payment information:**
-  - *x402 micropayments:* payer wallet address, payment amount, and authorization signatures. These are recorded on the public Base blockchain and are visible to anyone.
-  - *Stripe subscriptions:* payments are processed by Stripe, Inc. We do not receive or store your full card numbers. We store your Stripe customer/subscription identifiers and the SHA-256 hash of your subscriber key.
+  - *x402 micropayments:* payer wallet address, payment amount, and authorization signatures. These are recorded on the public Base blockchain and are visible to anyone. To verify and settle payments, the payment payload is transmitted to our x402 facilitator (Coinbase Developer Platform). We also log transaction metadata (transaction hash, payer address, amount) server-side, and we temporarily hold payment signatures in server memory (up to 5 minutes) to prevent replay attacks.
+  - *Stripe subscriptions:* payments are processed by Stripe, Inc. We do not receive or store your full card numbers. We store your Stripe customer identifier, the email address from your Checkout session, and the SHA-256 hash of your subscriber key.
 - **Support correspondence:** information you send us when you contact us.
 
 We do not require user accounts, do not use advertising trackers or third-party analytics cookies, and do not collect names, emails, or other profile data unless you provide them.
@@ -101,7 +101,7 @@ We do not require user accounts, do not use advertising trackers or third-party 
 
 ## 4. Data retention
 
-Operational logs are retained for up to 12 months, then deleted or anonymized. Payment records are retained as required for tax and accounting purposes (generally 7 years).
+Operational logs are retained for up to 12 months, then deleted or anonymized, as an operational practice (our hosting provider's own log retention also applies). Payment records are retained as required for tax and accounting purposes (generally 7 years).
 
 ## 5. Security
 
