@@ -44,6 +44,10 @@ def _enable_x402(monkeypatch, **over):
         "X402_PAY_TO": "0xAbC123",
         "X402_FACILITATOR_URL": "https://x402.test/facilitator",
         "X402_PRICE_USDC": "0.015",
+        # The free tier is ON by default and would serve anonymous callers;
+        # these tests assert the raw x402/subscriber flows, so pin it off
+        # (free-tier behavior has its own test module).
+        "FREE_TIER_ENABLED": "0",
     }
     env.update(over)
     for k, v in env.items():

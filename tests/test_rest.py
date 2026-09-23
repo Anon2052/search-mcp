@@ -108,6 +108,9 @@ def _enable_x402(monkeypatch):
     monkeypatch.setenv("X402_PAY_TO", "0xAbC123")
     monkeypatch.setenv("X402_FACILITATOR_URL", "https://x402.test/facilitator")
     monkeypatch.setenv("X402_PRICE_USDC", "0.015")
+    # The free tier is ON by default and would serve anonymous callers; these
+    # tests assert the raw x402 flow, so pin it off.
+    monkeypatch.setenv("FREE_TIER_ENABLED", "0")
 
 
 _x402_sig_counter = 0

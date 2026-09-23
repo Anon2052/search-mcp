@@ -423,28 +423,74 @@ def payment_invalid_response(reason: str) -> JSONResponse:
     )
 
 
-async def _resolve_price(request: Request) -> Decimal | None:
-    """Resolve the price for this request. None = exempt (serve without pay)."""
+def free_tier_exhausted_response(verdict: dict) -> JSONResponse:
+    """402 for an exhausted anonymous free-tier bucket. Deliberately NOT a
+    429: 429 is reserved exclusively for the subscriber monthly cap."""
+    return JSONResponse(
+        status_code=402,
+        content={
+            "error": "free_tier_exhausted",
+            "message": (
+                f"Free tier exhausted ({verdict['credits_used']} of "
+                f"{verdict['free_limit']} credits used this month). "
+                "Pay per call with x402 (resend with a signed X-Payment header) "
+                "or subscribe to Pro ($9/mo includes $10 of calls) for a higher limit."
+            ),
+            "credits_used": verdict["credits_used"],
+            "free_limit": verdict["free_limit"],
+            "resets_at": verdict["resets_at"],
+            "upgrade_hint": (
+                "Pay per call via x402, or subscribe to Pro at $9/mo "
+                "(includes $10 of calls) for a higher monthly limit."
+            ),
+        },
+    )
+
+
+async def _paid_call_info(request: Request) -> tuple[Decimal | None, str]:
+    """(price, tool label) for this request.
+
+    price None = exempt/free method (serve without pay). The tool label feeds
+    usage analytics. Unparseable bodies get the default price, never a 500.
+    """
     path = request.url.path
     tool = REST_PRICE_MAP.get(path)
     if tool is not None:
-        return price_for_tool_usdc(tool)
+        return price_for_tool_usdc(tool), tool
     if path == "/mcp" or path.startswith("/mcp/"):
         try:
             data = json.loads(await request.body())
         except (json.JSONDecodeError, UnicodeDecodeError):
-            # Unparseable body -> default price, never a 500.
-            return default_price_usdc()
+            return default_price_usdc(), "mcp_unknown"
         if not isinstance(data, dict):
-            return default_price_usdc()
+            return default_price_usdc(), "mcp_unknown"
         method = data.get("method", "")
         if method == "tools/call":
-            name = (data.get("params") or {}).get("name", "")
-            return price_for_tool_usdc(str(name))
+            name = str((data.get("params") or {}).get("name", "") or "unknown_tool")
+            return price_for_tool_usdc(name), name
         if method in EXEMPT_JSONRPC_METHODS or str(method).startswith("notifications/"):
-            return None
-        return default_price_usdc()
-    return default_price_usdc()
+            return None, str(method)
+        return default_price_usdc(), f"mcp:{method}"
+    return default_price_usdc(), "unknown"
+
+
+async def _resolve_price(request: Request) -> Decimal | None:
+    """Resolve the price for this request. None = exempt (serve without pay)."""
+    price, _ = await _paid_call_info(request)
+    return price
+
+
+def client_ip(request: Request) -> str:
+    """Best-effort client IP, Render-aware: first entry of X-Forwarded-For,
+    else the direct peer. Used only to key the anonymous free-tier bucket
+    (stored hashed); never logged or stored raw."""
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        first = xff.split(",")[0].strip()
+        if first:
+            return first
+    peer = request.client
+    return peer.host if peer else "unknown"
 
 
 class X402PaymentMiddleware(BaseHTTPMiddleware):
@@ -455,30 +501,47 @@ class X402PaymentMiddleware(BaseHTTPMiddleware):
         if any(path == p or path.startswith(p + "/") for p in EXEMPT_PREFIXES):
             return await call_next(request)
         if path == "/billing" or path.startswith("/billing/"):
-            # Stripe checkout/webhooks/status must work without x402:
+            # Stripe checkout/webhooks/status/stats must work without x402:
             # Stripe's servers cannot attach an X-Payment header, and
             # charging per-call for checkout would be circular for new
-            # subscribers. Subscriber keys bypass x402 below.
+            # subscribers. Subscriber keys bypass x402 below. /billing/stats
+            # is admin-authenticated and never consumes quota.
             return await call_next(request)
         if request.method == "GET" and path.startswith("/mcp"):
             # MCP discovery/info GETs stay free.
             return await call_next(request)
         if not x402_effective_enabled():
+            # Metering off: open access. Still rolled into usage analytics as
+            # free/zero-credit so pre-launch traffic stays visible.
+            if request.method == "POST":
+                from .billing import record_usage
+
+                price, tool = await _paid_call_info(request)
+                if price is not None:
+                    record_usage(tool, "free", 0.0)
             return await call_next(request)
         if request.method != "POST":
             return await call_next(request)
 
-        # Stripe subscriber bypass (invalid keys fall through to x402, not a
-        # hard error). Valid subscriber keys spend credits from the monthly
-        # fair-use cap — the credit cost derives from the same x402 price
-        # map used below (free paths cost 0 and are never gated). x402
-        # per-call payers are never capped.
-        from .billing import check_subscriber_usage, credits_for_price_usdc
+        # Stripe subscriber bypass (invalid keys fall through to the x402 /
+        # free-tier flow, not a hard error). Valid subscriber keys spend
+        # credits from the monthly fair-use cap — the credit cost derives from
+        # the same x402 price map used below (free paths cost 0 and are never
+        # gated). x402 per-call payers are never capped. The 429 code and body
+        # below are UNTOUCHED.
+        from .billing import (
+            check_free_tier_usage,
+            check_subscriber_usage,
+            credits_for_price_usdc,
+            free_tier_enabled_flag,
+            record_usage,
+        )
+
+        price, tool = await _paid_call_info(request)
+        credit_cost = 0.0 if price is None else credits_for_price_usdc(price)
 
         sub_key = request.headers.get("x-subscriber-key", "").strip()
         if sub_key:
-            price = await _resolve_price(request)
-            credit_cost = 0.0 if price is None else credits_for_price_usdc(price)
             verdict = check_subscriber_usage(sub_key, credit_cost)
             if verdict is not None:
                 if not verdict["ok"]:
@@ -500,10 +563,11 @@ class X402PaymentMiddleware(BaseHTTPMiddleware):
                             "resets_at": verdict["resets_at"],
                         },
                     )
+                record_usage(tool, "subscriber", credit_cost)
                 return await call_next(request)
 
-        price = await _resolve_price(request)
         if price is None:
+            # Free method (discovery etc.): serve without pay, no bucket.
             return await call_next(request)
 
         requirements = build_payment_requirements(
@@ -513,62 +577,76 @@ class X402PaymentMiddleware(BaseHTTPMiddleware):
         )
 
         raw = request.headers.get("x-payment")
-        if not raw:
+        if raw:
+            # x402-paid call: exempt from the free bucket, never capped.
+            try:
+                payload = decode_x_payment(raw)
+            except ValueError as exc:
+                return payment_required_response(requirements, reason=str(exc))
+            reason = sanity_check_payload(payload, requirements)
+            if reason:
+                return payment_required_response(requirements, reason=reason)
+
+            signature = payload["payload"]["signature"]
+            if seen_replay(signature):
+                return JSONResponse(
+                    status_code=402,
+                    content={"error": "duplicate_payment", "reason": "payment already used"},
+                )
+
+            try:
+                verification = await facilitator_verify(payload, requirements)
+            except FacilitatorUnavailable as exc:
+                # Fail closed: never serve paid content without verification.
+                log.error("x402 facilitator unavailable: %s", exc)
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "payment_verification_unavailable",
+                        "message": "Payment verification is temporarily unavailable.",
+                    },
+                )
+            if not verification.get("isValid"):
+                return payment_invalid_response(
+                    str(verification.get("invalidReason") or "facilitator rejected payment")
+                )
+
+            response = await call_next(request)
+            record_usage(tool, "x402", credit_cost)
+
+            # Settle after serving. A settle failure is logged loudly (money may
+            # be lost) but must NOT fail the already-served request.
+            try:
+                settled = await facilitator_settle(payload, requirements)
+                tx_hash = _settle_tx_hash(settled)
+                if settled.get("success") and tx_hash:
+                    log.info(
+                        "x402 settled: tx=%s payer=%s amount_atomic=%s",
+                        tx_hash,
+                        verification.get("payer"),
+                        requirements["maxAmountRequired"],
+                    )
+                else:
+                    log.error(
+                        "x402 settle FAILED (payment served but may not be collected): %s",
+                        settled.get("errorReason") or settled,
+                    )
+            except Exception:  # noqa: BLE001
+                log.exception("x402 settle FAILED (payment served but may not be collected)")
+            return response
+
+        # No subscriber key, no payment: the anonymous free tier (on by
+        # default; FREE_TIER_ENABLED=false skips it entirely and falls
+        # straight to the 402 challenge). Exhausted bucket -> 402 with
+        # free_tier_exhausted (NOT 429 — 429 is the subscriber cap only).
+        # Denied calls never consume credits.
+        if not free_tier_enabled_flag():
             return payment_required_response(requirements)
-        try:
-            payload = decode_x_payment(raw)
-        except ValueError as exc:
-            return payment_required_response(requirements, reason=str(exc))
-        reason = sanity_check_payload(payload, requirements)
-        if reason:
-            return payment_required_response(requirements, reason=reason)
-
-        signature = payload["payload"]["signature"]
-        if seen_replay(signature):
-            return JSONResponse(
-                status_code=402,
-                content={"error": "duplicate_payment", "reason": "payment already used"},
-            )
-
-        try:
-            verification = await facilitator_verify(payload, requirements)
-        except FacilitatorUnavailable as exc:
-            # Fail closed: never serve paid content without verification.
-            log.error("x402 facilitator unavailable: %s", exc)
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "payment_verification_unavailable",
-                    "message": "Payment verification is temporarily unavailable.",
-                },
-            )
-        if not verification.get("isValid"):
-            return payment_invalid_response(
-                str(verification.get("invalidReason") or "facilitator rejected payment")
-            )
-
-        response = await call_next(request)
-
-        # Settle after serving. A settle failure is logged loudly (money may
-        # be lost) but must NOT fail the already-served request.
-        try:
-            settled = await facilitator_settle(payload, requirements)
-            tx_hash = _settle_tx_hash(settled)
-            if settled.get("success") and tx_hash:
-                log.info(
-                    "x402 settled: tx=%s payer=%s amount_atomic=%s",
-                    tx_hash,
-                    verification.get("payer"),
-                    requirements["maxAmountRequired"],
-                )
-            else:
-                log.error(
-                    "x402 settle FAILED (payment served but may not be collected): %s",
-                    settled.get("errorReason") or settled,
-                )
-        except Exception:  # noqa: BLE001
-            log.exception("x402 settle FAILED (payment served but may not be collected)")
-        return response
+        free_verdict = check_free_tier_usage(client_ip(request), credit_cost)
+        if not free_verdict["ok"]:
+            return free_tier_exhausted_response(free_verdict)
+        record_usage(tool, "free", credit_cost)
+        return await call_next(request)
 
 
 def warn_if_payments_live() -> None:
