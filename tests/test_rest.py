@@ -160,3 +160,37 @@ def test_x402_enabled_accepts_structurally_valid_payment(stubbed_backends, monke
     r = xc.post("/search", json={"query": "q"}, headers=_payment_header())
     assert r.status_code == 200, r.text
     assert r.json()["results"][0]["title"] == "T"
+
+
+# ------------------------------------------------------------- MCP mount paths
+
+
+def _mcp_ping_body():
+    return {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+
+
+def _mcp_result(response):
+    # Streamable HTTP answers as SSE: extract the JSON payload of the message event.
+    assert response.status_code == 200, response.text
+    assert "text/event-stream" in response.headers["content-type"]
+    for line in response.text.splitlines():
+        if line.startswith("data: "):
+            import json
+
+            return json.loads(line[len("data: ") :])
+    raise AssertionError(f"no data event in MCP response: {response.text!r}")
+
+
+def test_mcp_bare_path_does_not_redirect(stubbed_backends):
+    # Bare /mcp (no trailing slash) must be served directly: many MCP clients
+    # don't follow the 307 Starlette's mount would otherwise issue.
+    with TestClient(create_app(), follow_redirects=False) as c:
+        r = c.post("/mcp", json=_mcp_ping_body())
+    assert r.status_code != 307, f"bare /mcp 307-redirected to {r.headers.get('location')}"
+    assert _mcp_result(r)["result"] == {}
+
+
+def test_mcp_trailing_slash_path_still_works(stubbed_backends):
+    with TestClient(create_app(), follow_redirects=False) as c:
+        r = c.post("/mcp/", json=_mcp_ping_body())
+    assert _mcp_result(r)["result"] == {}
