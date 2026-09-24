@@ -29,7 +29,12 @@ from .fetch import FetchError
 from .legal_docs import PRIVACY_POLICY, REFUND_POLICY, TERMS_OF_SERVICE
 from .mcp_server import mcp
 from .search import SearchError
-from .x402 import X402PaymentMiddleware, warn_if_payments_live, x402_effective_enabled
+from .x402 import (
+    X402PaymentMiddleware,
+    discovery_manifest,
+    warn_if_payments_live,
+    x402_effective_enabled,
+)
 
 log = logging.getLogger("search_mcp")
 
@@ -119,6 +124,13 @@ def create_app(rate_limit: str | None = None) -> FastAPI:
             "x402": "enabled" if x402_effective_enabled() else "disabled",
             "stripe": "enabled" if stripe_effective_enabled() else "disabled",
         }
+
+    @app.get("/.well-known/x402.json", include_in_schema=False)
+    async def x402_discovery():
+        # Public payment-metadata discovery. Deliberately NOT rate-limited or
+        # x402-gated (see EXEMPT_PREFIXES in x402.py): scanners and wallets
+        # must be able to read it without paying or authenticating.
+        return discovery_manifest()
 
     app.include_router(billing_router)
 

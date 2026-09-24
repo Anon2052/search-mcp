@@ -58,7 +58,15 @@ FACILITATOR_TIMEOUT_SECONDS = 15.0
 # exempt separately in the middleware: Stripe's webhooks cannot attach an
 # X-Payment header, and requiring per-call payment for checkout would be
 # circular for new subscribers.
-EXEMPT_PREFIXES = ("/health", "/docs", "/redoc", "/openapi.json", "/favicon.ico", "/legal")
+EXEMPT_PREFIXES = (
+    "/health",
+    "/docs",
+    "/redoc",
+    "/openapi.json",
+    "/favicon.ico",
+    "/legal",
+    "/.well-known",
+)
 
 # REST route -> tool name (per-repo map).
 REST_PRICE_MAP = {
@@ -647,6 +655,61 @@ class X402PaymentMiddleware(BaseHTTPMiddleware):
             return free_tier_exhausted_response(free_verdict)
         record_usage(tool, "free", credit_cost)
         return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
+# x402 discovery manifest (served at /.well-known/x402.json).
+# ---------------------------------------------------------------------------
+
+# Honest status strings for the discovery manifest. NEVER advertise live or
+# accepting payments unless x402_effective_enabled() is True.
+DISCOVERY_STATUS_ENABLED = "enabled"
+DISCOVERY_STATUS_DISABLED = "implemented_but_disabled"
+DISCOVERY_NOTE_DISABLED = (
+    "x402 payments are implemented but DISABLED in production. "
+    "They go live after business entity setup; no payments are accepted at "
+    "this time."
+)
+DISCOVERY_NOTE_ENABLED = "x402 payments are LIVE: per-call USDC micropayments are accepted."
+
+
+def discovery_manifest() -> dict:
+    """Build the public x402 discovery manifest.
+
+    Derived entirely from this module's constants — the single source of
+    truth for prices (PER_TOOL_DEFAULTS_USDC / DEFAULT_PRICE_USDC) and
+    asset/network identifiers (NETWORK, USDC_*). Nothing is hardcoded here.
+    ``pay_to`` is null unless X402_PAY_TO is set — we never invent an address.
+    """
+    enabled = x402_effective_enabled()
+    pay_to = x402_pay_to() or None
+    return {
+        "x402_status": DISCOVERY_STATUS_ENABLED if enabled else DISCOVERY_STATUS_DISABLED,
+        "note": DISCOVERY_NOTE_ENABLED if enabled else DISCOVERY_NOTE_DISABLED,
+        "protocol": "x402",
+        "version": X402_VERSION,
+        "scheme": SCHEME,
+        "network": NETWORK,
+        "asset": "USDC",
+        "asset_contract": USDC_BASE_ADDRESS,
+        "asset_decimals": USDC_DECIMALS,
+        "pay_to": pay_to,
+        "prices_usdc": {tool: str(price) for tool, price in PER_TOOL_DEFAULTS_USDC.items()},
+        "default_price_usdc": str(DEFAULT_PRICE_USDC),
+        "facilitator_default": DEFAULT_FACILITATOR_URL,
+        "facilitator_note": (
+            "Default facilitator serves Base Sepolia testnet only; "
+            "Base mainnet needs the CDP facilitator URL + keys."
+        ),
+        "free_endpoints": [
+            "/health",
+            "/.well-known/x402.json",
+            "/legal/terms",
+            "/legal/privacy",
+            "/legal/refunds",
+        ],
+        "documentation": "/docs",
+    }
 
 
 def warn_if_payments_live() -> None:
