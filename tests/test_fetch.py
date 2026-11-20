@@ -219,8 +219,7 @@ def test_pinned_backend_dials_validated_ip():
     dialed = []
 
     class FakeInner:
-        def connect_tcp(self, host, port, timeout=None, local_address=None,
-                        socket_options=None):
+        def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
             dialed.append(host)
             return object()
 

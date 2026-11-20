@@ -188,9 +188,7 @@ def _read_capped(resp: httpx.Response, max_bytes: int, deadline: float) -> bytes
     if declared is not None:
         try:
             if int(declared) > max_bytes:
-                raise FetchError(
-                    f"URL: content-length {declared} exceeds {max_bytes} byte limit"
-                )
+                raise FetchError(f"URL: content-length {declared} exceeds {max_bytes} byte limit")
         except ValueError:
             pass  # malformed header; the streaming cap below still applies
     chunks: list[bytes] = []

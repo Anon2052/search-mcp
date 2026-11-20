@@ -178,25 +178,19 @@ def _scope(*, peer, xff=None, cf_ip=None):
 def test_m3_spoofed_xff_ignored_on_direct_connection():
     """M-3: a direct client (global peer IP) cannot rotate rate-limit /
     billing buckets by spoofing X-Forwarded-For."""
-    key = rest_app_mod._client_ip_from_scope(
-        _scope(peer="8.8.8.8", xff="10.9.9.9")
-    )
+    key = rest_app_mod._client_ip_from_scope(_scope(peer="8.8.8.8", xff="10.9.9.9"))
     assert key == "8.8.8.8"
 
 
 def test_m3_xff_honored_behind_proxy():
     """M-3: behind Render's proxy (non-global peer) the first XFF entry is
     the real client IP."""
-    key = rest_app_mod._client_ip_from_scope(
-        _scope(peer="10.0.0.5", xff="8.8.8.8, 10.0.0.5")
-    )
+    key = rest_app_mod._client_ip_from_scope(_scope(peer="10.0.0.5", xff="8.8.8.8, 10.0.0.5"))
     assert key == "8.8.8.8"
 
 
 def test_m3_garbage_xff_falls_back_to_peer():
-    key = rest_app_mod._client_ip_from_scope(
-        _scope(peer="10.0.0.5", xff="not-an-ip")
-    )
+    key = rest_app_mod._client_ip_from_scope(_scope(peer="10.0.0.5", xff="not-an-ip"))
     assert key == "10.0.0.5"
 
 
@@ -206,35 +200,27 @@ def test_m3_garbage_xff_falls_back_to_peer():
 def test_cf_connecting_ip_honored_from_cloudflare_peer():
     """CF-Connecting-IP is trusted when the TCP peer is a Cloudflare edge
     IP (proxied DNS). 172.64.1.10 is inside 172.64.0.0/13."""
-    key = rest_app_mod._client_ip_from_scope(
-        _scope(peer="172.64.1.10", cf_ip="8.8.8.8")
-    )
+    key = rest_app_mod._client_ip_from_scope(_scope(peer="172.64.1.10", cf_ip="8.8.8.8"))
     assert key == "8.8.8.8"
 
 
 def test_cf_connecting_ip_honored_from_cloudflare_ipv6_peer():
     """Same fast path for a Cloudflare IPv6 edge peer (2606:4700::/32)."""
-    key = rest_app_mod._client_ip_from_scope(
-        _scope(peer="2606:4700:0:0:0:0:0:1", cf_ip="1.1.1.1")
-    )
+    key = rest_app_mod._client_ip_from_scope(_scope(peer="2606:4700:0:0:0:0:0:1", cf_ip="1.1.1.1"))
     assert key == "1.1.1.1"
 
 
 def test_cf_connecting_ip_ignored_from_non_cloudflare_peer():
     """A spoofed CF-Connecting-IP from a direct (non-Cloudflare) peer is
     ignored — falls back to existing direct-connection logic (XFF ignored)."""
-    key = rest_app_mod._client_ip_from_scope(
-        _scope(peer="8.8.8.8", cf_ip="1.2.3.4")
-    )
+    key = rest_app_mod._client_ip_from_scope(_scope(peer="8.8.8.8", cf_ip="1.2.3.4"))
     assert key == "8.8.8.8"
 
 
 def test_cf_connecting_ip_garbage_falls_back_to_peer():
     """Garbage CF-Connecting-IP from a Cloudflare peer falls back to the
     peer instead of poisoning the rate-limit bucket."""
-    key = rest_app_mod._client_ip_from_scope(
-        _scope(peer="172.64.1.10", cf_ip="not-an-ip")
-    )
+    key = rest_app_mod._client_ip_from_scope(_scope(peer="172.64.1.10", cf_ip="not-an-ip"))
     assert key == "172.64.1.10"
 
 
@@ -242,7 +228,5 @@ def test_cf_peer_without_cf_header_ignores_xff():
     """Cloudflare peer with no CF-Connecting-IP: XFF is NOT trusted (first
     XFF entry is client-spoofable through Cloudflare) — falls back to the
     peer, same as any global peer."""
-    key = rest_app_mod._client_ip_from_scope(
-        _scope(peer="172.64.1.10", xff="8.8.8.8")
-    )
+    key = rest_app_mod._client_ip_from_scope(_scope(peer="172.64.1.10", xff="8.8.8.8"))
     assert key == "172.64.1.10"

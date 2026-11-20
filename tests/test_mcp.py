@@ -61,6 +61,7 @@ def test_tool_descriptions_present():
 def test_tool_titles_and_annotations():
     """Claude directory readiness: every tool exposes a human title plus
     readOnly/destructive/idempotent/openWorld annotation hints."""
+
     async def go():
         async with Client(mcp) as client:
             return await client.list_tools()

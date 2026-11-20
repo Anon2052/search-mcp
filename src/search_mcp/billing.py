@@ -95,6 +95,7 @@ _DISK_DB_PATH = "/var/lib/search-mcp/billing.db"
 # at x402 list price, bundled with the $9/mo plan. Scott's call to change.
 _DEFAULT_MONTHLY_CREDIT_LIMIT = 1000.0
 
+
 def _placeholder_hash(customer_id: str) -> str:
     """Unique placeholder key_hash per customer (M-4).
 

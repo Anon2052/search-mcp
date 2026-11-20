@@ -70,9 +70,7 @@ def _mcp_call(client, ip=IP_A, **headers):
         "method": "tools/call",
         "params": {"name": "search_web", "arguments": {"query": "capital of Mongolia"}},
     }
-    return client.post(
-        "/mcp", json=body, headers={"X-Forwarded-For": ip, **headers}
-    )
+    return client.post("/mcp", json=body, headers={"X-Forwarded-For": ip, **headers})
 
 
 # ---------------------------------------------------------- deduction
