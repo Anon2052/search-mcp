@@ -1,6 +1,6 @@
 # Runtime dependencies — exact pins. Regenerate requirements.txt with:
 #   .venv/bin/pip-compile --generate-hashes requirements.in -o requirements.txt
-fastmcp==4.0.5
+fastmcp==4.1.2
 fastapi==0.141.1
 uvicorn==0.53.0
 slowapi==0.1.10

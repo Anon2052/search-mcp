@@ -11,6 +11,7 @@ import base64
 import hashlib
 import hmac
 import json
+import secrets
 import time
 
 import pytest
@@ -21,6 +22,13 @@ import search_mcp.x402 as x402_mod
 from search_mcp import fetch as fetch_mod
 from search_mcp import search as search_mod
 from search_mcp.rest_app import create_app
+
+
+@pytest.fixture(autouse=True)
+def _isolated_billing_db(monkeypatch, tmp_path):
+    """M-1: the replay table is persistent — point every test at a scratch
+    DB so claims can never leak between tests (or touch the real path)."""
+    monkeypatch.setenv("BILLING_DB_PATH", str(tmp_path / "billing.db"))
 
 
 @pytest.fixture()
@@ -41,13 +49,9 @@ def stubbed_backends(monkeypatch):
 def _enable_x402(monkeypatch, **over):
     env = {
         "X402_ENABLED": "true",
-        "X402_PAY_TO": "0xAbC123",
+        "X402_PAY_TO": "0x000000000000000000000000000000000000dEaD",
         "X402_FACILITATOR_URL": "https://x402.test/facilitator",
         "X402_PRICE_USDC": "0.015",
-        # The free tier is ON by default and would serve anonymous callers;
-        # these tests assert the raw x402/subscriber flows, so pin it off
-        # (free-tier behavior has its own test module).
-        "FREE_TIER_ENABLED": "0",
     }
     env.update(over)
     for k, v in env.items():
@@ -69,22 +73,21 @@ def _enable_stripe(monkeypatch, tmp_path, **over):
         monkeypatch.setenv(k, v)
 
 
-_sig_counter = 0
-
-
 def _x402_payload(value_atomic=25000, **auth_over):
-    global _sig_counter
-    _sig_counter += 1
-    # Unique signature per header so the anti-replay set can't leak between tests.
-    sig = auth_over.pop("signature", "0x" + f"{_sig_counter:064x}"[-64:])
+    # Unique random signature per header so the anti-replay set can't leak
+    # between tests. (A per-module counter looks unique but restarts in every
+    # test module, so counter values collide across modules in one pytest run.)
+    sig = auth_over.pop("signature", "0x" + secrets.token_hex(32))
     now = int(time.time())
     auth = {
         "from": "0xPayer000000000000000000000000000000000001",
-        "to": "0xAbC123",
+        "to": "0x000000000000000000000000000000000000dEaD",
         "value": str(value_atomic),
         "validAfter": str(now - 60),
-        "validBefore": str(now + 300),
-        "nonce": "0x" + f"{_sig_counter:064x}"[-64:],
+        # M-1: the authorization window must fit within MAX_TIMEOUT_SECONDS
+        # (300s); wider windows are rejected by the sanity check.
+        "validBefore": str(now + 240),
+        "nonce": "0x" + secrets.token_hex(32),
     }
     auth.update(auth_over)
     return {
@@ -129,16 +132,17 @@ def _fake_facilitator(monkeypatch, valid=True, unreachable=False, settle_ok=True
 
 
 def test_per_tool_price_defaults(stubbed_backends, monkeypatch):
-    _enable_x402(monkeypatch)
+    # Free tier off: this test reads the raw 402 challenge for pricing.
+    _enable_x402(monkeypatch, FREE_TIER_ENABLED="false")
     xc = TestClient(create_app())
     r = xc.post("/search", json={"query": "q"})
-    assert r.json()["paymentRequirements"]["maxAmountRequired"] == "25000"  # 0.025
+    assert r.json()["paymentRequirements"]["maxAmountRequired"] == "10000"  # 0.01
     r = xc.post("/fetch", json={"url": "https://example.com/"})
     assert r.json()["paymentRequirements"]["maxAmountRequired"] == "10000"  # 0.01
 
 
 def test_per_tool_env_override_only_affects_that_tool(stubbed_backends, monkeypatch):
-    _enable_x402(monkeypatch, X402_PRICE_SEARCH_WEB_USDC="0.10")
+    _enable_x402(monkeypatch, X402_PRICE_SEARCH_WEB_USDC="0.10", FREE_TIER_ENABLED="false")
     xc = TestClient(create_app())
     r = xc.post("/search", json={"query": "q"})
     assert r.json()["paymentRequirements"]["maxAmountRequired"] == "100000"
@@ -147,14 +151,14 @@ def test_per_tool_env_override_only_affects_that_tool(stubbed_backends, monkeypa
 
 
 def test_invalid_price_env_falls_back_to_default(stubbed_backends, monkeypatch):
-    _enable_x402(monkeypatch, X402_PRICE_FETCH_URL_USDC="banana")
+    _enable_x402(monkeypatch, X402_PRICE_FETCH_URL_USDC="banana", FREE_TIER_ENABLED="false")
     xc = TestClient(create_app())
     r = xc.post("/fetch", json={"url": "https://example.com/"})
     assert r.json()["paymentRequirements"]["maxAmountRequired"] == "10000"
 
 
 def test_402_challenge_shape(stubbed_backends, monkeypatch):
-    _enable_x402(monkeypatch)
+    _enable_x402(monkeypatch, FREE_TIER_ENABLED="false")
     xc = TestClient(create_app())
     r = xc.post("/search", json={"query": "q"})
     assert r.status_code == 402
@@ -165,8 +169,43 @@ def test_402_challenge_shape(stubbed_backends, monkeypatch):
     assert reqs["asset"] == x402_mod.USDC_BASE_ADDRESS
     assert reqs["scheme"] == "exact"
     assert reqs["network"] == "base"
-    assert reqs["payTo"] == "0xAbC123"
+    assert reqs["payTo"] == "0x000000000000000000000000000000000000dEaD"
     assert reqs["maxTimeoutSeconds"] == 300
+
+
+def test_402_canonical_shape(stubbed_backends, monkeypatch):
+    """The 402 body uses the canonical cross-repo shape: error/message/
+    accepts/paymentRequirements, with reason present on rejections."""
+    _enable_x402(monkeypatch, FREE_TIER_ENABLED="false")
+    _fake_facilitator(monkeypatch, valid=True)
+    xc = TestClient(create_app())
+
+    # Bare challenge: no reason key when there is no rejection detail.
+    r = xc.post("/search", json={"query": "q"})
+    assert r.status_code == 402
+    body = r.json()
+    assert body["error"] == "payment_required"
+    assert "x402 USDC micropayment" in body["message"]
+    assert "reason" not in body
+    assert body["accepts"] == {
+        "asset": "USDC",
+        "asset_contract": x402_mod.USDC_BASE_ADDRESS,
+        "network": "base",
+        "amount_usdc": "0.01",
+        "amount_atomic": "10000",
+        "pay_to": "0x000000000000000000000000000000000000dEaD",
+        "scheme": "exact",
+    }
+    assert body["paymentRequirements"]["maxAmountRequired"] == "10000"
+
+    # Rejection: reason present, challenge still attached.
+    r = xc.post("/search", json={"query": "q"}, headers=_x402_header(to="0xEvil999"))
+    assert r.status_code == 402
+    body = r.json()
+    assert body["error"] == "payment_required"
+    assert body["reason"] == "authorization recipient mismatch"
+    assert body["accepts"]["amount_atomic"] == "10000"
+    assert "paymentRequirements" in body
 
 
 # ------------------------------------------------------------- JSON-RPC discovery
@@ -189,7 +228,10 @@ def test_tools_list_stays_free(stubbed_backends, monkeypatch):
 
 
 def test_tools_call_requires_payment(stubbed_backends, monkeypatch):
-    _enable_x402(monkeypatch)
+    # Free tier off: with it on, the first anonymous calls are served from
+    # the bucket (see test_free_tier.py); this test exercises the raw
+    # payment-required path.
+    _enable_x402(monkeypatch, FREE_TIER_ENABLED="false")
     _fake_facilitator(monkeypatch, valid=True)
     with TestClient(create_app()) as xc:
         body = {
@@ -278,7 +320,10 @@ def test_replay_rejected(stubbed_backends, monkeypatch):
     _enable_x402(monkeypatch)
     _fake_facilitator(monkeypatch, valid=True)
     xc = TestClient(create_app())
-    headers = _x402_header(signature="0x" + "ee" * 32)
+    # One header built once: the second POST replays the SAME signature.
+    # The signature is random per test run so the persistent replay table
+    # (M-1) can't leak a claim between runs.
+    headers = _x402_header()
     assert xc.post("/search", json={"query": "q"}, headers=headers).status_code == 200
     r = xc.post("/search", json={"query": "q"}, headers=headers)
     assert r.status_code == 402
@@ -455,7 +500,10 @@ def test_subscriber_key_bypasses_x402(stubbed_backends, monkeypatch, tmp_path):
         conn.close()
     assert stored == hashlib.sha256(token.encode()).hexdigest()
     assert stored != token
-    # Bad key falls through to the x402 flow, not a hard error.
+    # Bad key falls through to the x402 flow, not a hard error (free tier
+    # off here — with it on, the fall-through lands in the free bucket
+    # first; see test_free_tier.py).
+    monkeypatch.setenv("FREE_TIER_ENABLED", "false")
     r = xc.post("/search", json={"query": "q"}, headers={"X-Subscriber-Key": "nope"})
     assert r.status_code == 402
 
@@ -527,7 +575,7 @@ def test_db_default_path_is_disk_mount(monkeypatch):
 def test_credit_cost_derives_from_price_map(monkeypatch):
     """Credit cost must come from the same price map the x402 middleware
     charges with — no duplicated price table."""
-    assert billing_mod.credits_for_price_usdc(x402_mod.price_for_tool_usdc("search_web")) == 2.5
+    assert billing_mod.credits_for_price_usdc(x402_mod.price_for_tool_usdc("search_web")) == 1.0
     assert billing_mod.credits_for_price_usdc(x402_mod.price_for_tool_usdc("fetch_url")) == 1.0
     # An env price override flows through to credits automatically.
     monkeypatch.setenv("X402_PRICE_SEARCH_WEB_USDC", "0.05")
@@ -560,9 +608,9 @@ def test_subscriber_under_cap_200_and_counted(stubbed_backends, monkeypatch, tmp
         r = xc.post("/search", json={"query": "q"}, headers={"X-Subscriber-Key": token})
         assert r.status_code == 200, r.text
 
-    # A $0.025 search deducts 2.5 credits: 3 x 2.5 = 7.5.
+    # A $0.01 search deducts 1.0 credit: 3 x 1.0 = 3.0.
     month, credits = _usage_row(tmp_path)
-    assert credits == 7.5
+    assert credits == 3.0
     assert month == billing_mod._current_month_utc()
 
 
@@ -580,8 +628,8 @@ def test_fractional_deduction_mixed_tools(stubbed_backends, monkeypatch, tmp_pat
         xc.post("/fetch", json={"url": "https://example.com/x"}, headers=headers).status_code == 200
     )
 
-    # search_web = 2.5 credits, fetch_url = 1.0 credit.
-    assert _usage_row(tmp_path)[1] == 3.5
+    # search_web = 1.0 credit, fetch_url = 1.0 credit.
+    assert _usage_row(tmp_path)[1] == 2.0
 
 
 def test_subscriber_over_cap_429(stubbed_backends, monkeypatch, tmp_path):
@@ -593,9 +641,9 @@ def test_subscriber_over_cap_429(stubbed_backends, monkeypatch, tmp_path):
 
     xc = TestClient(create_app())
     headers = {"X-Subscriber-Key": token}
-    # Two searches = 2 x 2.5 = 5.0 credits: exactly the cap.
-    assert xc.post("/search", json={"query": "q"}, headers=headers).status_code == 200
-    assert xc.post("/search", json={"query": "q"}, headers=headers).status_code == 200
+    # Five searches = 5 x 1.0 = 5.0 credits: exactly the cap.
+    for _ in range(5):
+        assert xc.post("/search", json={"query": "q"}, headers=headers).status_code == 200
 
     r = xc.post("/search", json={"query": "q"}, headers=headers)
     assert r.status_code == 429, r.text
@@ -613,14 +661,14 @@ def test_subscriber_over_cap_429(stubbed_backends, monkeypatch, tmp_path):
 def test_month_rollover_resets_counter(stubbed_backends, monkeypatch, tmp_path):
     _enable_x402(monkeypatch)
     _enable_stripe(monkeypatch, tmp_path)
-    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CREDIT_LIMIT", "2.5")
+    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CREDIT_LIMIT", "1.0")
     monkeypatch.setattr(billing_mod, "_current_month_utc", lambda: "2026-08")
     _fake_facilitator(monkeypatch, valid=True)
     token = _subscriber_token("cus_cap3")
 
     xc = TestClient(create_app())
     headers = {"X-Subscriber-Key": token}
-    # One search = 2.5 credits: exactly the cap.
+    # One search = 1.0 credit: exactly the cap.
     assert xc.post("/search", json={"query": "q"}, headers=headers).status_code == 200
     r = xc.post("/search", json={"query": "q"}, headers=headers)
     assert r.status_code == 429, r.text
@@ -630,13 +678,13 @@ def test_month_rollover_resets_counter(stubbed_backends, monkeypatch, tmp_path):
     monkeypatch.setattr(billing_mod, "_current_month_utc", lambda: "2026-09")
     r = xc.post("/search", json={"query": "q"}, headers=headers)
     assert r.status_code == 200, r.text
-    assert _usage_row(tmp_path) == ("2026-09", 2.5)
+    assert _usage_row(tmp_path) == ("2026-09", 1.0)
 
 
 def test_x402_payers_not_capped(stubbed_backends, monkeypatch, tmp_path):
     _enable_x402(monkeypatch)
     _enable_stripe(monkeypatch, tmp_path)
-    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CREDIT_LIMIT", "2.5")
+    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CREDIT_LIMIT", "1.0")
     _fake_facilitator(monkeypatch, valid=True)
     token = _subscriber_token("cus_cap4")
 
@@ -683,13 +731,13 @@ def test_free_paths_cost_zero_and_are_never_gated(stubbed_backends, monkeypatch,
     429-gated, even when the subscriber's credit cap is exhausted."""
     _enable_x402(monkeypatch)
     _enable_stripe(monkeypatch, tmp_path)
-    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CREDIT_LIMIT", "2.5")
+    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CREDIT_LIMIT", "1.0")
     _fake_facilitator(monkeypatch, valid=True)
     token = _subscriber_token("cus_free")
 
     xc = TestClient(create_app())
     headers = {"X-Subscriber-Key": token}
-    # Burn the whole cap on one search (2.5 credits).
+    # Burn the whole cap on one search (1.0 credit).
     assert xc.post("/search", json={"query": "q"}, headers=headers).status_code == 200
     assert xc.post("/search", json={"query": "q"}, headers=headers).status_code == 429
 
@@ -698,7 +746,7 @@ def test_free_paths_cost_zero_and_are_never_gated(stubbed_backends, monkeypatch,
         r = xc.post("/mcp", json=body, headers=headers)
         assert r.status_code == 200, r.text
     # No credits charged for the free call.
-    assert _usage_row(tmp_path)[1] == 2.5
+    assert _usage_row(tmp_path)[1] == 1.0
 
 
 def test_billing_usage_endpoint(stubbed_backends, monkeypatch, tmp_path):
@@ -724,7 +772,7 @@ def test_billing_usage_endpoint(stubbed_backends, monkeypatch, tmp_path):
     assert xc.post("/search", json={"query": "q"}, headers=headers).status_code == 200
     r = xc.get("/billing/usage", headers=headers)
     assert r.status_code == 200, r.text
-    assert r.json()["credits_used"] == 2.5
+    assert r.json()["credits_used"] == 1.0
 
     # Unknown key -> 401, not a 402 or 429.
     assert xc.get("/billing/usage", headers={"X-Subscriber-Key": "nope"}).status_code == 401
@@ -734,7 +782,7 @@ def test_billing_usage_never_429_gated(stubbed_backends, monkeypatch, tmp_path):
     """GET /billing/usage stays readable even after the cap is exhausted."""
     _enable_x402(monkeypatch)
     _enable_stripe(monkeypatch, tmp_path)
-    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CREDIT_LIMIT", "2.5")
+    monkeypatch.setenv("SUBSCRIBER_MONTHLY_CREDIT_LIMIT", "1.0")
     _fake_facilitator(monkeypatch, valid=True)
     token = _subscriber_token("cus_usage2")
 
@@ -745,7 +793,7 @@ def test_billing_usage_never_429_gated(stubbed_backends, monkeypatch, tmp_path):
 
     r = xc.get("/billing/usage", headers=headers)
     assert r.status_code == 200, r.text
-    assert r.json()["credits_used"] == 2.5
+    assert r.json()["credits_used"] == 1.0
 
 
 def test_billing_usage_404_when_stripe_disabled(monkeypatch, tmp_path):

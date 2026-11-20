@@ -12,6 +12,13 @@ from search_mcp import search as search_mod
 from search_mcp.rest_app import create_app
 
 
+@pytest.fixture(autouse=True)
+def _isolated_billing_db(monkeypatch, tmp_path):
+    """M-1: the replay table is persistent — point every test at a scratch
+    DB so claims can never leak between tests (or touch the real path)."""
+    monkeypatch.setenv("BILLING_DB_PATH", str(tmp_path / "billing.db"))
+
+
 @pytest.fixture()
 def stubbed_backends(monkeypatch):
     monkeypatch.setenv("SEARCH_API_KEY", "tvly-test")
@@ -80,6 +87,22 @@ def test_fetch_failure_returns_422(stubbed_backends, monkeypatch):
     assert r.json()["error"] == "fetch_failed"
 
 
+def test_fetch_invalid_url_returns_503(stubbed_backends, monkeypatch):
+    """httpx.InvalidURL is NOT an httpx.HTTPError subclass, so without an
+    explicit mapping it escapes fetch_url() as an unhandled 500. Upstream
+    fetch failures must be 503 instead."""
+    import httpx
+
+    def boom(url, timeout=20):
+        raise httpx.InvalidURL("Invalid port: '99999'")
+
+    monkeypatch.setattr(fetch_mod, "fetch_url", boom)
+    c = TestClient(create_app())
+    r = c.post("/fetch", json={"url": "https://example.com/"})
+    assert r.status_code == 503
+    assert r.json()["error"] == "fetch_failed"
+
+
 def test_search_backend_failure_returns_502(stubbed_backends, monkeypatch):
     monkeypatch.delenv("SEARCH_API_KEY", raising=False)
     c = TestClient(create_app())
@@ -105,37 +128,34 @@ def test_rate_limiting(stubbed_backends):
 
 def _enable_x402(monkeypatch):
     monkeypatch.setenv("X402_ENABLED", "true")
-    monkeypatch.setenv("X402_PAY_TO", "0xAbC123")
+    monkeypatch.setenv("X402_PAY_TO", "0x000000000000000000000000000000000000dEaD")
     monkeypatch.setenv("X402_FACILITATOR_URL", "https://x402.test/facilitator")
     monkeypatch.setenv("X402_PRICE_USDC", "0.015")
-    # The free tier is ON by default and would serve anonymous callers; these
-    # tests assert the raw x402 flow, so pin it off.
-    monkeypatch.setenv("FREE_TIER_ENABLED", "0")
-
-
-_x402_sig_counter = 0
 
 
 def _x402_header(value_atomic=25000, **auth_over):
     """Build a base64 v1 X-Payment header (signature not verified locally).
 
-    Each header gets a unique signature so the anti-replay set can't leak
-    between tests.
+    Each header gets a unique random signature so the anti-replay set can't
+    leak between tests. (A per-module counter looks unique but restarts in
+    every test module, so counter values collide across modules in one
+    pytest run.)
     """
     import base64
+    import secrets
     import time
 
-    global _x402_sig_counter
-    _x402_sig_counter += 1
-    sig = auth_over.pop("signature", "0x" + f"{_x402_sig_counter:064x}"[-64:])
+    sig = auth_over.pop("signature", "0x" + secrets.token_hex(32))
     now = int(time.time())
     auth = {
         "from": "0xPayer000000000000000000000000000000000001",
-        "to": "0xAbC123",
+        "to": "0x000000000000000000000000000000000000dEaD",
         "value": str(value_atomic),
         "validAfter": str(now - 60),
-        "validBefore": str(now + 300),
-        "nonce": "0x" + f"{_x402_sig_counter:064x}"[-64:],
+        # M-1: the authorization window must fit within MAX_TIMEOUT_SECONDS
+        # (300s); wider windows are rejected by the sanity check.
+        "validBefore": str(now + 240),
+        "nonce": "0x" + secrets.token_hex(32),
     }
     auth.update(auth_over)
     payload = {
@@ -176,6 +196,7 @@ def test_x402_disabled_by_default_passes_through(client):
 
 def test_x402_enabled_blocks_without_payment(stubbed_backends, monkeypatch):
     _enable_x402(monkeypatch)
+    monkeypatch.setenv("FREE_TIER_ENABLED", "false")  # raw payment path
     xc = TestClient(create_app())
     r = xc.post("/search", json={"query": "q"})
     assert r.status_code == 402
@@ -185,10 +206,10 @@ def test_x402_enabled_blocks_without_payment(stubbed_backends, monkeypatch):
     assert body["accepts"]["network"] == "base"
     assert body["accepts"]["scheme"] == "exact"
     reqs = body["paymentRequirements"]
-    assert reqs["asset"] == "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA38bD"
+    assert reqs["asset"] == "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
     assert reqs["network"] == "base"
-    # search_web default 0.025 USDC -> 25000 atomic units.
-    assert reqs["maxAmountRequired"] == "25000"
+    # search_web default 0.01 USDC -> 10000 atomic units.
+    assert reqs["maxAmountRequired"] == "10000"
 
 
 def test_x402_enabled_health_stays_free(stubbed_backends, monkeypatch):
@@ -225,3 +246,37 @@ def test_x402_enabled_rejects_facilitator_denial(stubbed_backends, monkeypatch):
     r = xc.post("/search", json={"query": "q"}, headers=_x402_header())
     assert r.status_code == 402
     assert r.json()["error"] == "payment_invalid"
+
+
+# ------------------------------------------------------------- MCP mount paths
+
+
+def _mcp_ping_body():
+    return {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+
+
+def _mcp_result(response):
+    # Streamable HTTP answers as SSE: extract the JSON payload of the message event.
+    assert response.status_code == 200, response.text
+    assert "text/event-stream" in response.headers["content-type"]
+    for line in response.text.splitlines():
+        if line.startswith("data: "):
+            import json
+
+            return json.loads(line[len("data: ") :])
+    raise AssertionError(f"no data event in MCP response: {response.text!r}")
+
+
+def test_mcp_bare_path_does_not_redirect(stubbed_backends):
+    # Bare /mcp (no trailing slash) must be served directly: many MCP clients
+    # don't follow the 307 Starlette's mount would otherwise issue.
+    with TestClient(create_app(), follow_redirects=False) as c:
+        r = c.post("/mcp", json=_mcp_ping_body())
+    assert r.status_code != 307, f"bare /mcp 307-redirected to {r.headers.get('location')}"
+    assert _mcp_result(r)["result"] == {}
+
+
+def test_mcp_trailing_slash_path_still_works(stubbed_backends):
+    with TestClient(create_app(), follow_redirects=False) as c:
+        r = c.post("/mcp/", json=_mcp_ping_body())
+    assert _mcp_result(r)["result"] == {}
