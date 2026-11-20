@@ -19,6 +19,7 @@ all three connectors — Scott's call, 2026-10-21).
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import sqlite3
 
@@ -37,6 +38,18 @@ from .test_payments import (
 
 IP_A = "10.0.0.1"
 IP_B = "10.0.0.2"
+
+
+def _next_month() -> str:
+    """Calendar month after the current UTC month.
+
+    The month-reset test must target a month different from 'now' — the
+    hardcoded '2026-11' went stale the moment November arrived and the
+    patch became a no-op.
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    year, month = (now.year + 1, 1) if now.month == 12 else (now.year, now.month + 1)
+    return f"{year:04d}-{month:02d}"
 
 
 @pytest.fixture(autouse=True)
@@ -136,10 +149,10 @@ def test_month_reset_refills_bucket(free_client, monkeypatch):
     _search(free_client)
     _search(free_client)
     assert _search(free_client).status_code == 402
-    monkeypatch.setattr(billing_mod, "_current_month_utc", lambda: "2026-11")
+    monkeypatch.setattr(billing_mod, "_current_month_utc", lambda: _next_month())
     assert _search(free_client).status_code == 200
     usage = billing_mod.get_free_tier_usage(IP_A)
-    assert usage["period"] == "2026-11"
+    assert usage["period"] == _next_month()
     assert usage["credits_used"] == 1.0
 
 

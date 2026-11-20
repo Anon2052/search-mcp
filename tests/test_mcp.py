@@ -79,7 +79,9 @@ def test_tool_titles_and_annotations():
         assert ann is not None, f"{name} missing annotations"
         assert ann.read_only_hint is True, f"{name} readOnlyHint"
         assert ann.destructive_hint is False, f"{name} destructiveHint"
-        assert ann.idempotent_hint is True, f"{name} idempotentHint"
+        # Open-world tools fetch live external state, so they are NOT
+        # idempotent; closed-world tools are.
+        assert ann.idempotent_hint is (not open_world), f"{name} idempotentHint"
         assert ann.open_world_hint is open_world, f"{name} openWorldHint"
 
 
