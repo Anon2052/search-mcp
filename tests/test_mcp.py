@@ -58,6 +58,33 @@ def test_tool_descriptions_present():
         assert tool.description, f"tool {tool.name} has no description"
 
 
+def test_tool_titles_and_annotations():
+    """Claude directory readiness: every tool exposes a human title plus
+    readOnly/destructive/idempotent/openWorld annotation hints."""
+
+    async def go():
+        async with Client(mcp) as client:
+            return await client.list_tools()
+
+    tools = {t.name: t for t in _run(go())}
+    expected = {
+        "search_web": ("Search the Web", True),
+        "fetch_url": ("Fetch URL as Text", True),
+    }
+    assert set(tools) == set(expected)
+    for name, (title, open_world) in expected.items():
+        tool = tools[name]
+        assert tool.title == title, f"{name} title"
+        ann = tool.annotations
+        assert ann is not None, f"{name} missing annotations"
+        assert ann.read_only_hint is True, f"{name} readOnlyHint"
+        assert ann.destructive_hint is False, f"{name} destructiveHint"
+        # Open-world tools fetch live external state, so they are NOT
+        # idempotent; closed-world tools are.
+        assert ann.idempotent_hint is (not open_world), f"{name} idempotentHint"
+        assert ann.open_world_hint is open_world, f"{name} openWorldHint"
+
+
 def test_mcp_search_web_roundtrip(stubbed_backends):
     async def go():
         async with Client(mcp) as client:

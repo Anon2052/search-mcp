@@ -17,17 +17,16 @@ Env:
         API calls bundled with the $9/mo Pro plan (Scott's call on the
         number; override with the env var). x402 per-call payers are not
         capped.
-    FREE_TIER_ENABLED (default "true"): kill switch for the anonymous free
-        tier. When "false"/"0", the free path is skipped entirely and
-        anonymous callers fall straight to the x402 402 challenge.
-    FREE_MONTHLY_CREDITS (default "50" — Scott's call): monthly credit
-        bucket for anonymous callers, keyed by client IP (hashed; the raw IP
-        is never stored). Same credit math as subscribers, from the same
-        x402 price map.
-    ADMIN_KEY (required for /billing/stats): shared secret for the usage
-        analytics endpoint, via X-Admin-Key header (preferred) or
-        ?admin_key= query param. Must be set on Render — a long random
-        string. Fail closed: unset/empty means the endpoint always 401s.
+
+Free tier: when x402 is enabled, anonymous callers (no subscriber key, no
+X-Payment) draw from a monthly free credit bucket keyed by client IP
+(``FREE_MONTHLY_CREDITS``, default 50 credits = $0.50 of calls at list
+price; kill switch ``FREE_TIER_ENABLED``, default on). Aligned across all
+three connectors — Scott's call, 2026-10-21: directory scanners and
+reviewers cannot pay per call, so the bucket is what lets them (and new
+users) evaluate the tools. Exhaustion -> HTTP 402 ``free_tier_exhausted``
+(429 stays exclusive to the subscriber cap). IPs are stored as SHA-256
+hashes, never raw.
 
 Subscriber storage: stdlib sqlite3. Only the SHA-256 hash of a subscriber
 key is stored — never the raw token. All endpoints 404 unless Stripe is
@@ -36,9 +35,7 @@ effectively enabled (fail closed).
 
 from __future__ import annotations
 
-import datetime
 import hashlib
-import hmac
 import logging
 import os
 import secrets
@@ -73,24 +70,20 @@ CREATE TABLE IF NOT EXISTS subscriber_usage (
     updated_at TEXT
 );
 
--- Anonymous free-tier bucket: one row per hashed client IP per month.
--- Only the SHA-256 of the IP is stored — never the raw IP.
-CREATE TABLE IF NOT EXISTS free_usage (
+-- M-1: persistent x402 anti-replay claims. Survives restarts and is shared
+-- across workers, closing the gaps of the old in-memory signature cache.
+CREATE TABLE IF NOT EXISTS x402_seen_signatures (
+    signature  TEXT PRIMARY KEY,
+    expires_at REAL NOT NULL
+);
+
+-- Free tier: monthly anonymous credit bucket, keyed by SHA-256 of the
+-- client IP (never the raw IP). See record_free_tier_usage.
+CREATE TABLE IF NOT EXISTS free_tier_usage (
     ip_hash    TEXT PRIMARY KEY,
     month      TEXT NOT NULL,
     credits    REAL NOT NULL DEFAULT 0,
     updated_at TEXT
-);
-
--- Usage analytics rollups: per-day aggregates by tool and plan type.
--- No PII here — IPs are never stored, only aggregate counts.
-CREATE TABLE IF NOT EXISTS usage_daily (
-    date       TEXT NOT NULL,
-    tool       TEXT NOT NULL,
-    plan_type  TEXT NOT NULL,
-    calls      INTEGER NOT NULL DEFAULT 0,
-    credits    REAL NOT NULL DEFAULT 0,
-    PRIMARY KEY (date, tool, plan_type)
 );
 """
 
@@ -102,7 +95,16 @@ _DISK_DB_PATH = "/var/lib/search-mcp/billing.db"
 # at x402 list price, bundled with the $9/mo plan. Scott's call to change.
 _DEFAULT_MONTHLY_CREDIT_LIMIT = 1000.0
 
-_PLACEHOLDER_HASH = "pending:" + "0" * 56  # replaced by GET /billing/key
+
+def _placeholder_hash(customer_id: str) -> str:
+    """Unique placeholder key_hash per customer (M-4).
+
+    The old single constant placeholder collided on the key_hash PRIMARY KEY
+    when two customers checked out before either minted a key: the second
+    webhook 500'd and Stripe retried forever. A per-customer placeholder keeps
+    the upsert's ON CONFLICT(customer_id) target collision-free.
+    """
+    return "pending:" + hashlib.sha256(customer_id.encode("utf-8")).hexdigest()
 
 
 def _env_flag(name: str, default: str = "false") -> bool:
@@ -178,9 +180,40 @@ def upsert_subscriber_placeholder(customer_id: str, email: str | None) -> None:
             ON CONFLICT(customer_id) DO UPDATE SET
                 email=excluded.email, status='active', updated_at=excluded.updated_at
             """,
-            (_PLACEHOLDER_HASH, customer_id, email, _now_iso(), _now_iso()),
+            (_placeholder_hash(customer_id), customer_id, email, _now_iso(), _now_iso()),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def claim_x402_signature(signature: str, expires_at: float) -> bool:
+    """Atomically claim an x402 payment signature (M-1 anti-replay).
+
+    Returns True when the signature was already claimed and has not expired
+    (a replay); False when this call claimed it. The claim is atomic
+    (INSERT PRIMARY KEY): concurrent duplicate submissions across the
+    facilitator-verify gap collapse to a single serve. Expired rows are
+    pruned opportunistically. An expired row can never mask a live
+    authorization: the sanity check bounds the validity window to
+    <= MAX_TIMEOUT_SECONDS <= the claim TTL, so a row only expires after
+    its authorization is already invalid.
+    """
+    conn = _db()
+    try:
+        try:
+            conn.execute(
+                "INSERT INTO x402_seen_signatures (signature, expires_at) VALUES (?, ?)",
+                (signature, expires_at),
+            )
+        except sqlite3.IntegrityError:
+            return True
+        conn.execute(
+            "DELETE FROM x402_seen_signatures WHERE expires_at <= ?",
+            (time.time(),),
+        )
+        conn.commit()
+        return False
     finally:
         conn.close()
 
@@ -403,242 +436,120 @@ def get_subscriber_credit_usage(token: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Free tier: anonymous monthly credit bucket keyed by client IP.
-# ---------------------------------------------------------------------------
-
-# Default anonymous bucket: 50 credits = $0.50 of x402 list-price calls per
-# month per IP. Scott's call — override with FREE_MONTHLY_CREDITS.
+# Free tier: monthly anonymous credit bucket keyed by client IP.
+#
+# Business decision — Scott's call (aligned across search / doc-convert /
+# price-tracker, 2026-10-21). Default 50 credits = $0.50 of API calls at
+# x402 list prices (1 credit = $0.01). Same credit math as the subscriber
+# cap: ``credits_for_price_usdc`` is the single conversion — billing never
+# prices a call itself; the x402 price map does.
 _DEFAULT_FREE_MONTHLY_CREDITS = 50.0
 
 
-def free_tier_enabled_flag() -> bool:
-    """Kill switch for the anonymous free tier. Default ON; set
-    FREE_TIER_ENABLED=false (or 0) to skip the free path entirely — anonymous
-    callers then fall straight to the x402 402 challenge."""
+def free_tier_enabled() -> bool:
+    """Kill switch: ``FREE_TIER_ENABLED=false``/``0`` skips the free path
+    entirely (anonymous calls fall straight to the x402 402 challenge)."""
     return _env_flag("FREE_TIER_ENABLED", "true")
 
 
-def _free_monthly_limit() -> float:
+def _free_monthly_credit_limit() -> float:
+    """Resolved monthly free credit bucket: env override -> baked-in
+    default. Zero is a legitimate value (no free calls); negative or
+    non-numeric values fall back to the default."""
     raw = os.environ.get("FREE_MONTHLY_CREDITS", "").strip()
     if not raw:
         return _DEFAULT_FREE_MONTHLY_CREDITS
     try:
         value = float(raw)
-        if value <= 0:
-            raise ValueError
-        return value
     except ValueError:
+        value = -1.0
+    if value < 0 or value != value or value in (float("inf"), float("-inf")):
         log.warning(
             "invalid FREE_MONTHLY_CREDITS=%r; using default %g",
             raw,
             _DEFAULT_FREE_MONTHLY_CREDITS,
         )
         return _DEFAULT_FREE_MONTHLY_CREDITS
+    return value
 
 
-def _hash_ip(ip: str) -> str:
-    return hashlib.sha256(ip.encode()).hexdigest()
+def record_free_tier_usage(ip: str, credit_cost: float) -> dict:
+    """Check + deduct free-tier credits for one anonymous call.
 
+    Keyed by SHA-256 of the client IP (never the raw IP), calendar month
+    UTC. Calls whose credit cost would push usage over the bucket are
+    rejected and deduct NOTHING. Zero-cost calls are always allowed, even
+    at a zero credit limit.
 
-def check_free_tier_usage(ip: str, credit_cost: float) -> dict:
-    """Charge one call's credit cost against the anonymous free-tier bucket.
+    Returns ``{"allowed": bool, "credits_used": float, "free_limit":
+    float, "resets_at": str}``.
 
-    Keyed by client IP — only the SHA-256 of the IP is stored, never the raw
-    IP. Same credit math as subscribers (``credits_for_price_usdc`` over the
-    x402 price map: the single source of truth). Denied calls are never
-    charged. The bucket resets on the calendar-month boundary (UTC).
-
-    Returns a verdict dict:
-        {"ok": True,  "credits_used": n, "free_limit": L,
-         "credit_cost": c, "resets_at": "..."}
-        {"ok": False, ...}   (bucket exhausted; NOT charged)
+    Concurrency: the read-modify-write rides SQLite's single-writer lock,
+    so cap enforcement under heavy concurrency is best-effort — the same
+    note as the subscriber cap. Abuse backstop is the 60/min per-IP rate
+    limit, not this bucket; IP rotation is an accepted v1 limitation.
     """
-    ip_hash = _hash_ip(ip or "unknown")
+    ip_hash = hashlib.sha256(ip.encode("utf-8")).hexdigest()
     month = _current_month_utc()
-    limit = _free_monthly_limit()
+    limit = _free_monthly_credit_limit()
     conn = _db()
     try:
         row = conn.execute(
-            "SELECT month, credits FROM free_usage WHERE ip_hash = ?",
+            "SELECT month, credits FROM free_tier_usage WHERE ip_hash = ?",
             (ip_hash,),
         ).fetchone()
         used = float(row["credits"]) if row is not None and row["month"] == month else 0.0
-        if credit_cost > 0 and used + credit_cost > limit:
-            return {
-                "ok": False,
-                "credits_used": round(used, 1),
-                "free_limit": limit,
-                "credit_cost": credit_cost,
-                "resets_at": _next_month_start_iso(),
-            }
-        if credit_cost > 0:
-            # Atomic upsert: reset the counter when the stored month is stale.
-            conn.execute(
-                """
-                INSERT INTO free_usage (ip_hash, month, credits, updated_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(ip_hash) DO UPDATE SET
-                    month = excluded.month,
-                    credits = CASE
-                        WHEN free_usage.month = excluded.month
-                        THEN free_usage.credits + excluded.credits
-                        ELSE excluded.credits
-                    END,
-                    updated_at = excluded.updated_at
-                """,
-                (ip_hash, month, credit_cost, _now_iso()),
-            )
-            conn.commit()
-        charged = used + credit_cost if credit_cost > 0 else used
-        return {
-            "ok": True,
-            "credits_used": round(charged, 1),
+        verdict = {
+            "credits_used": round(used, 1),
             "free_limit": limit,
-            "credit_cost": credit_cost,
             "resets_at": _next_month_start_iso(),
         }
-    finally:
-        conn.close()
-
-
-# ---------------------------------------------------------------------------
-# Usage analytics: per-day rollups by tool and plan type.
-#
-# No PII: IPs are never stored here, only aggregate counts. Every served
-# call that passes the metering hook is recorded — credits actually deducted
-# (free/subscriber) or the list-price credit equivalent (x402). Zero-credit
-# outcomes (free methods on a paid path) are recorded as 0.
-# ---------------------------------------------------------------------------
-
-_PLAN_TYPES = ("free", "subscriber", "x402")
-_MAX_STATS_DAYS = 365
-
-
-def _today_utc() -> str:
-    """Current calendar date as "YYYY-MM-DD" (UTC). Small and patchable so
-    tests can simulate the day boundary."""
-    return time.strftime("%Y-%m-%d", time.gmtime())
-
-
-def record_usage(tool: str, plan_type: str, credit_cost: float) -> None:
-    """Roll one served call into usage_daily.
-
-    Fail-safe by design: analytics must never break serving, so DB errors are
-    logged and swallowed. A programming bug (unknown plan_type) still raises
-    loudly so tests catch it.
-    """
-    if plan_type not in _PLAN_TYPES:
-        raise ValueError(f"unknown plan_type: {plan_type!r}")
-    try:
-        conn = _db()
-    except Exception:  # noqa: BLE001
-        log.warning("usage analytics unavailable (billing db open failed)", exc_info=True)
-        return
-    try:
+        if credit_cost <= 0:
+            return {"allowed": True, **verdict}
+        if used + credit_cost > limit:
+            return {"allowed": False, **verdict}
         conn.execute(
             """
-            INSERT INTO usage_daily (date, tool, plan_type, calls, credits)
-            VALUES (?, ?, ?, 1, ?)
-            ON CONFLICT(date, tool, plan_type) DO UPDATE SET
-                calls = usage_daily.calls + 1,
-                credits = ROUND(usage_daily.credits + excluded.credits, 1)
+            INSERT INTO free_tier_usage (ip_hash, month, credits, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(ip_hash) DO UPDATE SET
+                month = excluded.month,
+                credits = CASE
+                    WHEN free_tier_usage.month = excluded.month
+                    THEN free_tier_usage.credits + excluded.credits
+                    ELSE excluded.credits
+                END,
+                updated_at = excluded.updated_at
             """,
-            (_today_utc(), tool, plan_type, round(float(credit_cost), 1)),
+            (ip_hash, month, credit_cost, _now_iso()),
         )
         conn.commit()
-    except Exception:  # noqa: BLE001
-        log.warning("usage analytics write failed", exc_info=True)
+        return {"allowed": True, **{**verdict, "credits_used": round(used + credit_cost, 1)}}
     finally:
         conn.close()
 
 
-def _empty_plan_rollup() -> dict:
-    return {plan: {"calls": 0, "credits": 0.0} for plan in _PLAN_TYPES}
-
-
-def get_usage_stats(days: int | str = 30) -> dict:
-    """Per-day usage rollups plus totals.
-
-    Shape:
-        {"days": [{"date", "calls", "credits",
-                   "tools": {tool: {"free": {"calls", "credits"},
-                                    "subscriber": {...}, "x402": {...}}}}],
-         "totals": {"calls", "credits",
-                    "tools": {tool: {plan: {"calls", "credits"}}}}}
-    ``days`` is clamped to [1, 365]; every day in the window appears even
-    with zero traffic.
-    """
+def get_free_tier_usage(ip: str) -> dict:
+    """Read-only free-bucket peek for an IP — never deducts, never gates."""
+    ip_hash = hashlib.sha256(ip.encode("utf-8")).hexdigest()
+    month = _current_month_utc()
+    used = 0.0
+    conn = _db()
     try:
-        days = int(days)
-    except (TypeError, ValueError):
-        days = 30
-    days = max(1, min(_MAX_STATS_DAYS, days))
-    today = datetime.date.fromisoformat(_today_utc())
-    start = (today - datetime.timedelta(days=days - 1)).isoformat()
-    day_list = [(today - datetime.timedelta(days=days - 1 - i)).isoformat() for i in range(days)]
-    per_day: dict[str, dict] = {d: {} for d in day_list}
-    try:
-        conn = _db()
-    except Exception:  # noqa: BLE001
-        log.warning("usage stats unavailable (billing db open failed)", exc_info=True)
-        conn = None
-    if conn is not None:
-        try:
-            rows = conn.execute(
-                "SELECT date, tool, plan_type, calls, credits FROM usage_daily "
-                "WHERE date >= ? AND date <= ?",
-                (start, today.isoformat()),
-            ).fetchall()
-        finally:
-            conn.close()
-        for row in rows:
-            tools = per_day[row["date"]]
-            entry = tools.setdefault(row["tool"], _empty_plan_rollup())
-            if row["plan_type"] in _PLAN_TYPES:
-                entry[row["plan_type"]] = {
-                    "calls": row["calls"],
-                    "credits": round(float(row["credits"]), 1),
-                }
-    days_out = []
-    totals_tools: dict[str, dict] = {}
-    total_calls = 0
-    total_credits = 0.0
-    for day in day_list:
-        tools = per_day[day]
-        day_calls = sum(plan["calls"] for entry in tools.values() for plan in entry.values())
-        day_credits = round(
-            sum(plan["credits"] for entry in tools.values() for plan in entry.values()), 1
-        )
-        days_out.append({"date": day, "calls": day_calls, "credits": day_credits, "tools": tools})
-        total_calls += day_calls
-        total_credits = round(total_credits + day_credits, 1)
-        for tool, plans in tools.items():
-            agg = totals_tools.setdefault(tool, _empty_plan_rollup())
-            for plan in _PLAN_TYPES:
-                agg[plan]["calls"] += plans[plan]["calls"]
-                agg[plan]["credits"] = round(agg[plan]["credits"] + plans[plan]["credits"], 1)
+        row = conn.execute(
+            "SELECT month, credits FROM free_tier_usage WHERE ip_hash = ?",
+            (ip_hash,),
+        ).fetchone()
+        if row is not None and row["month"] == month:
+            used = float(row["credits"])
+    finally:
+        conn.close()
     return {
-        "days": days_out,
-        "totals": {"calls": total_calls, "credits": total_credits, "tools": totals_tools},
+        "credits_used": round(used, 1),
+        "free_limit": _free_monthly_credit_limit(),
+        "resets_at": _next_month_start_iso(),
+        "period": month,
     }
-
-
-# ---------------------------------------------------------------------------
-# Admin auth for /billing/stats.
-# ---------------------------------------------------------------------------
-
-
-def _admin_key_expected() -> str:
-    return os.environ.get("ADMIN_KEY", "").strip()
-
-
-def admin_key_valid(provided: str | None) -> bool:
-    """Shared-secret check for /billing/stats. Fail closed: when ADMIN_KEY is
-    unset or empty, nothing is ever authorized."""
-    expected = _admin_key_expected()
-    if not expected or not provided:
-        return False
-    return hmac.compare_digest(provided.strip(), expected)
 
 
 def _ev(obj, key, default=None):
@@ -787,25 +698,4 @@ async def billing_status() -> JSONResponse:
             "stripe_enabled": stripe_effective_enabled(),
             "x402_enabled": x402_effective_enabled(),
         },
-    )
-
-
-@router.get("/stats")
-async def usage_stats(request: Request) -> JSONResponse:
-    """Usage analytics rollups (see get_usage_stats).
-
-    Auth: ADMIN_KEY shared secret via X-Admin-Key header (preferred) or
-    ?admin_key= query param. 401 JSON when missing/mismatched; fail closed
-    when ADMIN_KEY is unset. Un-metered: /billing/* is exempt from the x402
-    middleware, and this endpoint never touches any quota. Not gated on
-    Stripe — ADMIN_KEY is the gate.
-    """
-    provided = request.headers.get("x-admin-key", "") or request.query_params.get("admin_key", "")
-    if not admin_key_valid(provided):
-        return JSONResponse(
-            status_code=401,
-            content={"error": "unauthorized", "message": "Valid X-Admin-Key required."},
-        )
-    return JSONResponse(
-        status_code=200, content=get_usage_stats(request.query_params.get("days", 30))
     )

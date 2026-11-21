@@ -33,24 +33,9 @@ services:
         sync: false
       - key: STRIPE_CANCEL_URL
         sync: false
-      # BILLING_DB_PATH points at the persistent disk mount below. Set explicitly:
-      # Render does not remove env vars deleted from render.yaml, so omitting it
-      # would leave the live service pinned to the old ./data/subscribers.db path.
-      - key: BILLING_DB_PATH
-        value: "/var/lib/search-mcp/billing.db"
-      # Anonymous free tier: monthly credit bucket per client IP, keyed off
-      # the same x402 price map as subscribers. 50 credits = $0.50 of
-      # list-price calls (Scott's call — tune FREE_MONTHLY_CREDITS).
-      # FREE_TIER_ENABLED=false kills the free path (straight to 402).
-      - key: FREE_TIER_ENABLED
-        value: "true"
-      - key: FREE_MONTHLY_CREDITS
-        value: "50"
-      # ADMIN_KEY gates GET /billing/stats (usage analytics). Scott must set
-      # this in the Render dashboard to a long random string — the endpoint
-      # 401s until it is set.
-      - key: ADMIN_KEY
-        sync: false
+      # BILLING_DB_PATH is intentionally NOT set here: the code default points
+      # at the persistent disk mount below (single source of truth). Override
+      # per-environment in the dashboard if ever needed.
       - key: RATE_LIMIT
         value: "60/minute"
       - key: SEARCH_API_KEY
