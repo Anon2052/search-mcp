@@ -1,20 +1,21 @@
 services:
   - type: web
     name: search-mcp
-    runtime: docker
-    dockerfilePath: ./Dockerfile
+    runtime: image
+    image:
+      url: docker.io/ioconnex/search-mcp:20261121a
     healthCheckPath: /health
     plan: starter
     autoDeploy: true
     envVars:
       - key: X402_ENABLED
-        value: "false"
+        value: "true"
       - key: X402_PAY_TO
         sync: false
       - key: X402_FACILITATOR_URL
         sync: false
       - key: X402_PRICE_SEARCH_WEB_USDC
-        value: "0.025"
+        value: "0.01"
       - key: X402_PRICE_FETCH_URL_USDC
         value: "0.01"
       - key: CDP_API_KEY_ID
