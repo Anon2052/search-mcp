@@ -3,7 +3,7 @@ services:
     name: search-mcp
     runtime: image
     image:
-      url: docker.io/ioconnex/search-mcp:20261121a
+      url: docker.io/ioconnex/search-mcp:20261121b
     healthCheckPath: /health
     plan: starter
     autoDeploy: true
