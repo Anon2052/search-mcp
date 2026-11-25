@@ -16,17 +16,17 @@ Web search + URL fetch MCP server (streamable HTTP) + REST API. Connector #2 in 
 - `POST /fetch` → `{"url"}` → `{"text"}`
 - `POST /mcp` → MCP over streamable HTTP (stateless)
 
-60/min per-IP rate limit (`RATE_LIMIT`). Per-call payments via x402 (USDC on Base, facilitator-verified) and monthly plans via Stripe — **both OFF by default** (`X402_ENABLED=false`, `STRIPE_ENABLED=false`).
+60/min per-IP rate limit (`RATE_LIMIT`). Per-call payments via x402 (USDC on Base, facilitator-verified) are **live** on the hosted service since Oct 20, 2026, with 50 free calls per IP per month; monthly plans via Stripe are off by default (`STRIPE_ENABLED=false`).
 
-## Pricing (proposed — Scott's call)
+## Pricing (live since Oct 20, 2026)
 
 | Tool / plan | Price | Mechanism |
 |---|---|---|
-| `search_web` | $0.025/call | x402 USDC on Base |
+| `search_web` | $0.01/call | x402 USDC on Base |
 | `fetch_url` | $0.01/call | x402 USDC on Base |
 | Pro Monthly | $9/mo | Stripe subscription → subscriber key bypasses per-call charges (fair use) |
 
-Per-tool prices are baked in as defaults but **overridable without a deploy**: `X402_PRICE_<TOOLNAME>_USDC` (e.g. `X402_PRICE_SEARCH_WEB_USDC=0.05`). `X402_PRICE_USDC` (default `0.015`) is the fallback for unmapped calls.
+Per-tool prices are baked in as defaults but **overridable without a deploy**: `X402_PRICE_<TOOLNAME>_USDC` (e.g. `X402_PRICE_SEARCH_WEB_USDC=0.05`). `X402_PRICE_USDC` (default `0.01`) is the fallback for unmapped calls.
 
 MCP discovery (`initialize`, `tools/list`, `ping`, notifications) stays free so directory scanners keep working.
 
@@ -45,11 +45,11 @@ curl localhost:8000/health
 |---|---|---|
 | `SEARCH_API_KEY` | unset | **Required** for search. Never commit it. |
 | `PORT` / `HOST` | `8000` / `0.0.0.0` | `PORT` injected by the host |
-| `X402_ENABLED` | `false` | Per-call x402 payments. **Leave off until** `X402_PAY_TO` + `X402_FACILITATOR_URL` are set, CDP keys are in place for mainnet, and the AZ LLC is formed |
+| `X402_ENABLED` | `false` | Per-call x402 payments. **Live** on the hosted service since Oct 20, 2026. For self-hosted runs, set `X402_PAY_TO` + `X402_FACILITATOR_URL` (CDP mainnet facilitator + keys) to enable |
 | `X402_PAY_TO` | unset | Your Base wallet address receiving USDC |
 | `X402_FACILITATOR_URL` | `https://x402.org/facilitator` | **Base Sepolia testnet only.** For Base mainnet: `https://api.cdp.coinbase.com/platform/v2/x402` + `CDP_API_KEY_ID`/`CDP_API_KEY_SECRET` |
 | `X402_FACILITATOR_API_KEY` | unset | Optional: `X-API-Key` auth for facilitators that use it |
-| `X402_PRICE_SEARCH_WEB_USDC` / `X402_PRICE_FETCH_URL_USDC` | `0.025` / `0.01` | Proposed defaults — Scott's call |
+| `X402_PRICE_SEARCH_WEB_USDC` / `X402_PRICE_FETCH_URL_USDC` | `0.01` / `0.01` | Live defaults |
 | `STRIPE_ENABLED` | `false` | Monthly subscriber plans. Requires `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_ID` (create the product/price in the Stripe dashboard) |
 | `STRIPE_SUCCESS_URL` / `STRIPE_CANCEL_URL` | unset | Checkout redirect URLs (success URL should include `?session_id={CHECKOUT_SESSION_ID}`) |
 | `BILLING_DB_PATH` | `/var/lib/search-mcp/billing.db` | SQLite subscriber store (only key hashes are stored). Must sit on the Render persistent disk (`render.yaml` `disk:` stanza); when developing locally, set this to `./data/subscribers.db` since `/var/lib` usually isn't writable |
@@ -65,8 +65,9 @@ curl localhost:8000/health
 - `GET /billing/status` → `{"stripe_enabled","x402_enabled"}` (no secrets)
 
 Subscribers send `X-Subscriber-Key: <key>` instead of `X-Payment`.
-Subscriber-key calls spend credits from the monthly fair-use cap (`SUBSCRIBER_MONTHLY_CREDIT_LIMIT`, default 1000/month UTC) — 1 credit = $0.01 of x402 list price (a search = 2.5 credits, a fetch = 1.0). Over the cap returns HTTP 429 with `credits_used`, `credit_limit`, and `resets_at` — paying per call via x402 still works.
+Subscriber-key calls spend credits from the monthly fair-use cap (`SUBSCRIBER_MONTHLY_CREDIT_LIMIT`, default 1000/month UTC) — 1 credit = $0.01 of x402 list price (a search = 1.0 credit, a fetch = 1.0). Over the cap returns HTTP 429 with `credits_used`, `credit_limit`, and `resets_at` — paying per call via x402 still works.
 
 ## Deploy
 
 See [DEPLOY.md](DEPLOY.md). One-click: `render.yaml` blueprint (Starter plan) — Render prompts for `SEARCH_API_KEY` at deploy time.
+
